@@ -220,18 +220,35 @@ func extractServiceFromHost(ctx context.Context, host string) string {
 		}
 		return "default"
 	}
-	defaultHost := appengine.DefaultVersionHostname(ctx)
-	if host == defaultHost {
-		return "default"
-	}
 
 	if idx := strings.Index(host, ":"); idx != -1 {
 		host = host[:idx]
 	}
 
+	project := appengine.AppID(ctx)
+	if idx := strings.Index(project, "~"); idx != -1 {
+		project = project[idx+1:]
+	}
+
+	// Find the domain suffix starting from the project ID
+	pIdx := strings.Index(host, project)
+	if pIdx == -1 {
+		// Fallback to defaultHost check if project ID not found in host
+		defaultHost := appengine.DefaultVersionHostname(ctx)
+		if host == defaultHost {
+			return "default"
+		}
+		return host
+	}
+
+	domainSuffix := host[pIdx:]
+	if host == domainSuffix {
+		return "default"
+	}
+
 	suffixes := []string{
-		"." + defaultHost,
-		"-dot-" + defaultHost,
+		"." + domainSuffix,
+		"-dot-" + domainSuffix,
 	}
 	stripped := host
 	for _, suffix := range suffixes {
