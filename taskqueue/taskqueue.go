@@ -376,6 +376,9 @@ func Delete(c context.Context, task *Task, queueName string) error {
 // Each task is deleted independently; one may fail to delete while the others
 // are successfully deleted.
 func DeleteMulti(c context.Context, tasks []*Task, queueName string) error {
+	if os.Getenv("GAE_PUSHQUEUE_BACKEND") == "CLOUD_TASK" {
+		return deleteMultiInCloudTasks(c, tasks, queueName)
+	}
 	taskNames := make([][]byte, len(tasks))
 	for i, t := range tasks {
 		taskNames[i] = []byte(t.Name)

@@ -26,6 +26,7 @@ type PendingCloudTask struct {
 	TaskName  string    `datastore:"task_name"`
 	Payload   string    `datastore:"payload,noindex"`
 	Created   time.Time `datastore:"created"`
+	Status    string    `datastore:"status"`
 }
 
 var (
@@ -41,6 +42,7 @@ func init() {
 	internal.RollbackHook = func(handle uint64) {
 		cleanupPendingTasks(handle)
 	}
+	http.HandleFunc("/_ah/cloudtask/sweep", handleSweep)
 }
 
 func cleanupPendingTasks(handle uint64) {
@@ -99,6 +101,10 @@ func dispatchPendingTasks(ctx context.Context, handle uint64) {
 
 		err = sendRESTTask(noCancelCtx, taskEntity.QueueName, taskEntity.TaskName, taskEntity.Payload)
 		if err != nil {
+			if err == ErrTaskAlreadyAdded {
+				datastore.Delete(noCancelCtx, key)
+				continue
+			}
 			logErrorf(ctx, "Failed to dispatch task %s to queue %s: %v", taskEntity.TaskName, taskEntity.QueueName, err)
 			continue
 		}
@@ -270,15 +276,15 @@ func extractServiceFromHost(ctx context.Context, host string) string {
 	return "default"
 }
 
-func buildRESTPayload(ctx context.Context, queueName string, task *Task) (string, string, error) {
+func buildTaskMap(ctx context.Context, queueName string, task *Task) (map[string]interface{}, string, error) {
 	if task.Name != "" {
 		if !taskNameRegex.MatchString(task.Name) {
-			return "", "", fmt.Errorf("taskqueue: invalid task name %q", task.Name)
+			return nil, "", fmt.Errorf("taskqueue: invalid task name %q", task.Name)
 		}
 	}
 
 	if len(task.Payload) > 100*1024 {
-		return "", "", fmt.Errorf("taskqueue: task too large (%d bytes)", len(task.Payload))
+		return nil, "", fmt.Errorf("taskqueue: task too large (%d bytes)", len(task.Payload))
 	}
 
 	project := appengine.AppID(ctx)
@@ -288,7 +294,7 @@ func buildRESTPayload(ctx context.Context, queueName string, task *Task) (string
 
 	region, err := getRegion(ctx)
 	if err != nil {
-		return "", "", err
+		return nil, "", err
 	}
 
 	taskName := task.Name
@@ -374,6 +380,15 @@ func buildRESTPayload(ctx context.Context, queueName string, task *Task) (string
 		}
 	}
 
+	return taskMap, taskName, nil
+}
+
+func buildRESTPayload(ctx context.Context, queueName string, task *Task) (string, string, error) {
+	taskMap, taskName, err := buildTaskMap(ctx, queueName, task)
+	if err != nil {
+		return "", "", err
+	}
+
 	reqMap := map[string]interface{}{
 		"task": taskMap,
 	}
@@ -397,12 +412,13 @@ func addInCloudTasks(ctx context.Context, task *Task, queueName string) (*Task, 
 	}
 
 	if t := internal.TransactionFromContext(ctx); t != nil {
-		key := datastore.NewIncompleteKey(ctx, "_PendingCloudTask", nil)
+		key := datastore.NewIncompleteKey(ctx, "_AE_PendingCloudTask", nil)
 		pendingTask := &PendingCloudTask{
 			QueueName: queueName,
 			TaskName:  taskName,
 			Payload:   payload,
 			Created:   time.Now(),
+			Status:    "PENDING",
 		}
 		key, err = datastore.Put(ctx, key, pendingTask)
 		if err != nil {
@@ -432,16 +448,129 @@ func addInCloudTasks(ctx context.Context, task *Task, queueName string) (*Task, 
 }
 
 func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) ([]*Task, error) {
+	if internal.TransactionFromContext(ctx) != nil {
+		me, any := make(appengine.MultiError, len(tasks)), false
+		results := make([]*Task, len(tasks))
+		for i, task := range tasks {
+			res, err := addInCloudTasks(ctx, task, queueName)
+			if err != nil {
+				me[i] = err
+				any = true
+			} else {
+				results[i] = res
+			}
+		}
+		if any {
+			return results, me
+		}
+		return results, nil
+	}
+
+	if queueName == "" {
+		queueName = "default"
+	}
+	project := appengine.AppID(ctx)
+	if idx := strings.Index(project, "~"); idx != -1 {
+		project = project[idx+1:]
+	}
+	region, err := getRegion(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get region: %v", err)
+	}
+	token, err := getAccessToken(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get access token: %v", err)
+	}
+	fullQueueName := fmt.Sprintf("projects/%s/locations/%s/queues/%s", project, region, queueName)
+
 	me, any := make(appengine.MultiError, len(tasks)), false
 	results := make([]*Task, len(tasks))
 
-	for i, task := range tasks {
-		res, err := addInCloudTasks(ctx, task, queueName)
+	chunkSize := 100
+	for chunkStart := 0; chunkStart < len(tasks); chunkStart += chunkSize {
+		chunkEnd := chunkStart + chunkSize
+		if chunkEnd > len(tasks) {
+			chunkEnd = len(tasks)
+		}
+		chunkTasks := tasks[chunkStart:chunkEnd]
+
+		requests := make([]map[string]interface{}, 0, len(chunkTasks))
+		for i, t := range chunkTasks {
+			taskMap, taskName, err := buildTaskMap(ctx, queueName, t)
+			if err != nil {
+				me[chunkStart+i] = err
+				any = true
+				continue
+			}
+			results[chunkStart+i] = new(Task)
+			*results[chunkStart+i] = *t
+			results[chunkStart+i].Name = taskName
+			results[chunkStart+i].Method = t.method()
+
+			requests = append(requests, map[string]interface{}{
+				"parent": fullQueueName,
+				"task":   taskMap,
+			})
+		}
+		if len(requests) == 0 {
+			continue
+		}
+
+		batchPayload, err := json.Marshal(map[string]interface{}{"requests": requests})
 		if err != nil {
-			me[i] = err
-			any = true
+			for i := range chunkTasks {
+				if me[chunkStart+i] == nil {
+					me[chunkStart+i] = err
+					any = true
+				}
+			}
+			continue
+		}
+
+		url := fmt.Sprintf("https://cloudtasks.googleapis.com/v2beta3/%s/tasks:batchCreate", fullQueueName)
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(batchPayload))
+		if err != nil {
+			for i := range chunkTasks {
+				if me[chunkStart+i] == nil {
+					me[chunkStart+i] = err
+					any = true
+				}
+			}
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		resp, err := http.DefaultClient.Do(req.WithContext(ctx))
+		if err != nil {
+			for i := range chunkTasks {
+				if me[chunkStart+i] == nil {
+					me[chunkStart+i] = err
+					any = true
+				}
+			}
+			continue
+		}
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+			continue
+		} else if resp.StatusCode == http.StatusConflict {
+			for i := range chunkTasks {
+				if me[chunkStart+i] == nil {
+					me[chunkStart+i] = ErrTaskAlreadyAdded
+					any = true
+				}
+			}
 		} else {
-			results[i] = res
+			err := fmt.Errorf("cloud tasks REST batchCreate returned status %d: %s", resp.StatusCode, string(respBody))
+			for i := range chunkTasks {
+				if me[chunkStart+i] == nil {
+					me[chunkStart+i] = err
+					any = true
+				}
+			}
 		}
 	}
 
@@ -449,4 +578,130 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 		return results, me
 	}
 	return results, nil
+}
+
+func deleteMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) error {
+	if queueName == "" {
+		queueName = "default"
+	}
+	project := appengine.AppID(ctx)
+	if idx := strings.Index(project, "~"); idx != -1 {
+		project = project[idx+1:]
+	}
+	region, err := getRegion(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get region: %v", err)
+	}
+	token, err := getAccessToken(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get access token: %v", err)
+	}
+	fullQueueName := fmt.Sprintf("projects/%s/locations/%s/queues/%s", project, region, queueName)
+
+	me, any := make(appengine.MultiError, len(tasks)), false
+
+	chunkSize := 1000
+	for chunkStart := 0; chunkStart < len(tasks); chunkStart += chunkSize {
+		chunkEnd := chunkStart + chunkSize
+		if chunkEnd > len(tasks) {
+			chunkEnd = len(tasks)
+		}
+		chunkTasks := tasks[chunkStart:chunkEnd]
+
+		names := make([]string, len(chunkTasks))
+		for i, t := range chunkTasks {
+			names[i] = fmt.Sprintf("%s/tasks/%s", fullQueueName, t.Name)
+		}
+
+		batchPayload, err := json.Marshal(map[string]interface{}{"names": names})
+		if err != nil {
+			for i := range chunkTasks {
+				me[chunkStart+i] = err
+				any = true
+			}
+			continue
+		}
+
+		url := fmt.Sprintf("https://cloudtasks.googleapis.com/v2beta3/%s/tasks:batchDelete", fullQueueName)
+		req, err := http.NewRequest("POST", url, bytes.NewBuffer(batchPayload))
+		if err != nil {
+			for i := range chunkTasks {
+				me[chunkStart+i] = err
+				any = true
+			}
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		resp, err := http.DefaultClient.Do(req.WithContext(ctx))
+		if err != nil {
+			for i := range chunkTasks {
+				me[chunkStart+i] = err
+				any = true
+			}
+			continue
+		}
+		respBody, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted {
+			continue
+		} else {
+			err := fmt.Errorf("cloud tasks REST batchDelete returned status %d: %s", resp.StatusCode, string(respBody))
+			for i := range chunkTasks {
+				me[chunkStart+i] = err
+				any = true
+			}
+		}
+	}
+
+	if any {
+		return me
+	}
+	return nil
+}
+
+func sweep(ctx context.Context) error {
+	query := datastore.NewQuery("_AE_PendingCloudTask")
+	var tasks []PendingCloudTask
+	keys, err := query.GetAll(ctx, &tasks)
+	if err != nil {
+		return fmt.Errorf("failed to query _AE_PendingCloudTask: %v", err)
+	}
+
+	now := time.Now()
+	count := 0
+	for i, key := range keys {
+		task := tasks[i]
+		if !task.Created.IsZero() && now.Sub(task.Created) < 60*time.Second {
+			continue
+		}
+
+		err := sendRESTTask(ctx, task.QueueName, task.TaskName, task.Payload)
+		if err != nil && err != ErrTaskAlreadyAdded {
+			logErrorf(ctx, "Sweeper failed to dispatch task %s: %v", task.TaskName, err)
+			continue
+		}
+
+		if err := datastore.Delete(ctx, key); err != nil {
+			logErrorf(ctx, "Sweeper failed to delete entity %s: %v", task.TaskName, err)
+		}
+		count++
+	}
+
+	log.Printf("Cloud Tasks sweeper processed %d tasks.", count)
+	return nil
+}
+
+func handleSweep(w http.ResponseWriter, r *http.Request) {
+	ctx := appengine.NewContext(r)
+	if err := sweep(ctx); err != nil {
+		logErrorf(ctx, "Sweeper failed: %v", err)
+		http.Error(w, fmt.Sprintf("Sweeper failed: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("Sweeper completed successfully.\n"))
 }
