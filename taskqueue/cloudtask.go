@@ -121,6 +121,15 @@ func dispatchPendingTasks(ctx context.Context, handle uint64) {
 			continue
 		}
 
+		now := time.Now()
+		taskEntity.Status = "PROCESSING"
+		taskEntity.LockExpires = now.Add(60 * time.Second)
+		taskEntity.HandledBySweeper = false
+		if _, err := datastore.Put(noCancelCtx, key, &taskEntity); err != nil {
+			logErrorf(ctx, "Failed to acquire lock in fast-path for task %s: %v", taskEntity.getTaskName(), err)
+			continue
+		}
+
 		err = sendRESTTask(noCancelCtx, taskEntity.QueueName, taskEntity.getTaskName(), taskEntity.getPayload())
 		if err != nil {
 			if err == ErrTaskAlreadyAdded {
