@@ -32,23 +32,6 @@ type PendingCloudTask struct {
 	LastError        string    `datastore:"last_error,noindex"`
 	HandledBySweeper bool      `datastore:"handled_by_sweeper"`
 	SdkLang          string    `datastore:"sdk_lang"`
-	// Legacy fields for backwards compatibility
-	LegacyTaskName string `datastore:"task_name,omitempty"`
-	LegacyPayload  string `datastore:"payload,omitempty,noindex"`
-}
-
-func (p *PendingCloudTask) getTaskName() string {
-	if p.CloudTaskName != "" {
-		return p.CloudTaskName
-	}
-	return p.LegacyTaskName
-}
-
-func (p *PendingCloudTask) getPayload() string {
-	if p.CloudTaskPayload != "" {
-		return p.CloudTaskPayload
-	}
-	return p.LegacyPayload
 }
 
 var (
@@ -126,17 +109,17 @@ func dispatchPendingTasks(ctx context.Context, handle uint64) {
 		taskEntity.LockExpires = now.Add(60 * time.Second)
 		taskEntity.HandledBySweeper = false
 		if _, err := datastore.Put(noCancelCtx, key, &taskEntity); err != nil {
-			logErrorf(ctx, "Failed to acquire lock in fast-path for task %s: %v", taskEntity.getTaskName(), err)
+			logErrorf(ctx, "Failed to acquire lock in fast-path for task %s: %v", taskEntity.CloudTaskName, err)
 			continue
 		}
 
-		err = sendRESTTask(noCancelCtx, taskEntity.QueueName, taskEntity.getTaskName(), taskEntity.getPayload())
+		err = sendRESTTask(noCancelCtx, taskEntity.QueueName, taskEntity.CloudTaskName, taskEntity.CloudTaskPayload)
 		if err != nil {
 			if err == ErrTaskAlreadyAdded {
 				datastore.Delete(noCancelCtx, key)
 				continue
 			}
-			logErrorf(ctx, "Failed to dispatch task %s to queue %s: %v", taskEntity.getTaskName(), taskEntity.QueueName, err)
+			logErrorf(ctx, "Failed to dispatch task %s to queue %s: %v", taskEntity.CloudTaskName, taskEntity.QueueName, err)
 			taskEntity.RetryCount++
 			taskEntity.LastError = err.Error()
 			if len(taskEntity.LastError) > 500 {
@@ -149,7 +132,7 @@ func dispatchPendingTasks(ctx context.Context, handle uint64) {
 
 		err = datastore.Delete(noCancelCtx, key)
 		if err != nil {
-			logErrorf(ctx, "Failed to delete pending task %s from Datastore: %v", taskEntity.getTaskName(), err)
+			logErrorf(ctx, "Failed to delete pending task %s from Datastore: %v", taskEntity.CloudTaskName, err)
 		}
 	}
 }
@@ -738,13 +721,13 @@ func sweep(ctx context.Context) error {
 		task.LockExpires = now.Add(60 * time.Second)
 		task.HandledBySweeper = true
 		if _, err := datastore.Put(ctx, key, &task); err != nil {
-			logErrorf(ctx, "Sweeper failed to acquire lock for task %s: %v", task.getTaskName(), err)
+			logErrorf(ctx, "Sweeper failed to acquire lock for task %s: %v", task.CloudTaskName, err)
 			continue
 		}
 
-		err := sendRESTTask(ctx, task.QueueName, task.getTaskName(), task.getPayload())
+		err := sendRESTTask(ctx, task.QueueName, task.CloudTaskName, task.CloudTaskPayload)
 		if err != nil && err != ErrTaskAlreadyAdded {
-			logErrorf(ctx, "Sweeper failed to dispatch task %s: %v", task.getTaskName(), err)
+			logErrorf(ctx, "Sweeper failed to dispatch task %s: %v", task.CloudTaskName, err)
 			task.RetryCount++
 			task.LastError = err.Error()
 			if len(task.LastError) > 500 {
@@ -758,13 +741,13 @@ func sweep(ctx context.Context) error {
 				task.LockExpires = time.Time{}
 			}
 			if _, putErr := datastore.Put(ctx, key, &task); putErr != nil {
-				logErrorf(ctx, "Sweeper failed to record error state for task %s: %v", task.getTaskName(), putErr)
+				logErrorf(ctx, "Sweeper failed to record error state for task %s: %v", task.CloudTaskName, putErr)
 			}
 			continue
 		}
 
 		if err := datastore.Delete(ctx, key); err != nil {
-			logErrorf(ctx, "Sweeper failed to delete entity %s: %v", task.getTaskName(), err)
+			logErrorf(ctx, "Sweeper failed to delete entity %s: %v", task.CloudTaskName, err)
 		}
 		count++
 	}
