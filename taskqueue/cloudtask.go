@@ -22,11 +22,33 @@ import (
 )
 
 type PendingCloudTask struct {
-	QueueName string    `datastore:"queue_name"`
-	TaskName  string    `datastore:"task_name"`
-	Payload   string    `datastore:"payload,noindex"`
-	Created   time.Time `datastore:"created"`
-	Status    string    `datastore:"status"`
+	QueueName        string    `datastore:"queue_name"`
+	CloudTaskName    string    `datastore:"cloud_task_name"`
+	CloudTaskPayload string    `datastore:"cloud_task_payload,noindex"`
+	Created          time.Time `datastore:"created"`
+	Status           string    `datastore:"status"`
+	LockExpires      time.Time `datastore:"lock_expires"`
+	RetryCount       int64     `datastore:"retry_count"`
+	LastError        string    `datastore:"last_error,noindex"`
+	HandledBySweeper bool      `datastore:"handled_by_sweeper"`
+	SdkLang          string    `datastore:"sdk_lang"`
+	// Legacy fields for backwards compatibility
+	LegacyTaskName string `datastore:"task_name,omitempty"`
+	LegacyPayload  string `datastore:"payload,omitempty,noindex"`
+}
+
+func (p *PendingCloudTask) getTaskName() string {
+	if p.CloudTaskName != "" {
+		return p.CloudTaskName
+	}
+	return p.LegacyTaskName
+}
+
+func (p *PendingCloudTask) getPayload() string {
+	if p.CloudTaskPayload != "" {
+		return p.CloudTaskPayload
+	}
+	return p.LegacyPayload
 }
 
 var (
@@ -99,19 +121,26 @@ func dispatchPendingTasks(ctx context.Context, handle uint64) {
 			continue
 		}
 
-		err = sendRESTTask(noCancelCtx, taskEntity.QueueName, taskEntity.TaskName, taskEntity.Payload)
+		err = sendRESTTask(noCancelCtx, taskEntity.QueueName, taskEntity.getTaskName(), taskEntity.getPayload())
 		if err != nil {
 			if err == ErrTaskAlreadyAdded {
 				datastore.Delete(noCancelCtx, key)
 				continue
 			}
-			logErrorf(ctx, "Failed to dispatch task %s to queue %s: %v", taskEntity.TaskName, taskEntity.QueueName, err)
+			logErrorf(ctx, "Failed to dispatch task %s to queue %s: %v", taskEntity.getTaskName(), taskEntity.QueueName, err)
+			taskEntity.RetryCount++
+			taskEntity.LastError = err.Error()
+			if len(taskEntity.LastError) > 500 {
+				taskEntity.LastError = taskEntity.LastError[:500]
+			}
+			taskEntity.Status = "PENDING"
+			datastore.Put(noCancelCtx, key, &taskEntity)
 			continue
 		}
 
 		err = datastore.Delete(noCancelCtx, key)
 		if err != nil {
-			logErrorf(ctx, "Failed to delete pending task %s from Datastore: %v", taskEntity.TaskName, err)
+			logErrorf(ctx, "Failed to delete pending task %s from Datastore: %v", taskEntity.getTaskName(), err)
 		}
 	}
 }
@@ -414,11 +443,15 @@ func addInCloudTasks(ctx context.Context, task *Task, queueName string) (*Task, 
 	if t := internal.TransactionFromContext(ctx); t != nil {
 		key := datastore.NewIncompleteKey(ctx, "_AE_PendingCloudTask", nil)
 		pendingTask := &PendingCloudTask{
-			QueueName: queueName,
-			TaskName:  taskName,
-			Payload:   payload,
-			Created:   time.Now(),
-			Status:    "PENDING",
+			QueueName:        queueName,
+			CloudTaskName:    taskName,
+			CloudTaskPayload: payload,
+			Created:          time.Now(),
+			Status:           "PENDING",
+			RetryCount:       0,
+			LastError:        "",
+			HandledBySweeper: false,
+			SdkLang:          "GO",
 		}
 		key, err = datastore.Put(ctx, key, pendingTask)
 		if err != nil {
@@ -674,18 +707,55 @@ func sweep(ctx context.Context) error {
 	count := 0
 	for i, key := range keys {
 		task := tasks[i]
-		if !task.Created.IsZero() && now.Sub(task.Created) < 60*time.Second {
+		if task.Status == "DONE" || task.Status == "ALREADY_EXISTS" {
+			continue
+		}
+		if task.Status == "PROCESSING" {
+			if !task.LockExpires.IsZero() && now.Before(task.LockExpires) {
+				continue // Still actively processing and lock valid
+			} else if task.LockExpires.IsZero() {
+				continue // Assume lock valid if just started
+			}
+		} else if task.Status == "PENDING" || task.Status == "" {
+			if !task.Created.IsZero() && now.Sub(task.Created) < 60*time.Second {
+				continue // Give fast-path 60s to dispatch post-commit
+			}
+		} else if task.Status == "FAILED" && task.RetryCount >= 5 {
+			continue // Exceeded max sweeper retries
+		}
+
+		// Acquire lock
+		task.Status = "PROCESSING"
+		task.LockExpires = now.Add(60 * time.Second)
+		task.HandledBySweeper = true
+		if _, err := datastore.Put(ctx, key, &task); err != nil {
+			logErrorf(ctx, "Sweeper failed to acquire lock for task %s: %v", task.getTaskName(), err)
 			continue
 		}
 
-		err := sendRESTTask(ctx, task.QueueName, task.TaskName, task.Payload)
+		err := sendRESTTask(ctx, task.QueueName, task.getTaskName(), task.getPayload())
 		if err != nil && err != ErrTaskAlreadyAdded {
-			logErrorf(ctx, "Sweeper failed to dispatch task %s: %v", task.TaskName, err)
+			logErrorf(ctx, "Sweeper failed to dispatch task %s: %v", task.getTaskName(), err)
+			task.RetryCount++
+			task.LastError = err.Error()
+			if len(task.LastError) > 500 {
+				task.LastError = task.LastError[:500]
+			}
+			if task.RetryCount >= 5 {
+				task.Status = "FAILED"
+				task.LockExpires = time.Time{}
+			} else {
+				task.Status = "PENDING"
+				task.LockExpires = time.Time{}
+			}
+			if _, putErr := datastore.Put(ctx, key, &task); putErr != nil {
+				logErrorf(ctx, "Sweeper failed to record error state for task %s: %v", task.getTaskName(), putErr)
+			}
 			continue
 		}
 
 		if err := datastore.Delete(ctx, key); err != nil {
-			logErrorf(ctx, "Sweeper failed to delete entity %s: %v", task.TaskName, err)
+			logErrorf(ctx, "Sweeper failed to delete entity %s: %v", task.getTaskName(), err)
 		}
 		count++
 	}
@@ -695,6 +765,11 @@ func sweep(ctx context.Context) error {
 }
 
 func handleSweep(w http.ResponseWriter, r *http.Request) {
+	isCron := strings.EqualFold(r.Header.Get("X-AppEngine-Cron"), "true") || strings.EqualFold(r.Header.Get("X-Appengine-Cron"), "true")
+	if !isCron && !appengine.IsDevAppServer() {
+		http.Error(w, "Access denied: endpoint only accessible via App Engine Cron.", http.StatusForbidden)
+		return
+	}
 	ctx := appengine.NewContext(r)
 	if err := sweep(ctx); err != nil {
 		logErrorf(ctx, "Sweeper failed: %v", err)
