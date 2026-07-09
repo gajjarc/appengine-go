@@ -19,6 +19,7 @@ import (
 	"google.golang.org/appengine"
 	"google.golang.org/appengine/datastore"
 	"google.golang.org/appengine/internal"
+	pb "google.golang.org/appengine/internal/taskqueue"
 )
 
 type PendingCloudTask struct {
@@ -580,6 +581,7 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 		resp.Body.Close()
 
 		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
+			parseOperationErrors(respBody, len(chunkTasks), chunkStart, me, &any, false)
 			continue
 		} else if resp.StatusCode == http.StatusConflict {
 			for i := range chunkTasks {
@@ -671,6 +673,7 @@ func deleteMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName strin
 		resp.Body.Close()
 
 		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted {
+			parseOperationErrors(respBody, len(chunkTasks), chunkStart, me, &any, true)
 			continue
 		} else {
 			err := fmt.Errorf("cloud tasks REST batchDelete returned status %d: %s", resp.StatusCode, string(respBody))
@@ -771,4 +774,74 @@ func handleSweep(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Sweeper completed successfully.\n"))
+}
+
+type operationResponse struct {
+	Error *struct {
+		Code    int    `json:"code"`
+		Message string `json:"message"`
+	} `json:"error"`
+	Metadata *struct {
+		FailedRequests      map[string]struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"failedRequests"`
+		FailedRequestsSnake map[string]struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"failed_requests"`
+	} `json:"metadata"`
+}
+
+func parseOperationErrors(respBody []byte, totalTasks int, chunkStart int, me appengine.MultiError, any *bool, isDelete bool) {
+	var opResp operationResponse
+	if err := json.Unmarshal(respBody, &opResp); err != nil {
+		return
+	}
+	if opResp.Error != nil && opResp.Error.Code != 0 {
+		err := mapOperationErrorCode(opResp.Error.Code, opResp.Error.Message, isDelete)
+		for i := 0; i < totalTasks; i++ {
+			if me[chunkStart+i] == nil {
+				me[chunkStart+i] = err
+				*any = true
+			}
+		}
+		return
+	}
+	if opResp.Metadata != nil {
+		failedReqs := opResp.Metadata.FailedRequests
+		if len(failedReqs) == 0 {
+			failedReqs = opResp.Metadata.FailedRequestsSnake
+		}
+		for idxStr, fail := range failedReqs {
+			var idx int
+			if _, err := fmt.Sscanf(idxStr, "%d", &idx); err == nil && idx >= 0 && idx < totalTasks {
+				if me[chunkStart+idx] == nil {
+					me[chunkStart+idx] = mapOperationErrorCode(fail.Code, fail.Message, isDelete)
+					*any = true
+				}
+			}
+		}
+	}
+}
+
+func mapOperationErrorCode(code int, msg string, isDelete bool) error {
+	if isDelete && (code == 5 || code == 404 || strings.Contains(strings.ToLower(msg), "not found") || strings.Contains(strings.ToLower(msg), "unknown")) {
+		return &internal.APIError{
+			Service: "taskqueue",
+			Detail:  msg,
+			Code:    int32(pb.TaskQueueServiceError_UNKNOWN_TASK),
+		}
+	}
+	if code == 6 || code == 409 || strings.Contains(strings.ToLower(msg), "already exists") || ((code == 5 || code == 404) && strings.Contains(strings.ToLower(msg), "requested entity was not found")) {
+		return ErrTaskAlreadyAdded
+	}
+	if code == 5 || code == 404 {
+		return &internal.APIError{
+			Service: "taskqueue",
+			Detail:  msg,
+			Code:    int32(pb.TaskQueueServiceError_UNKNOWN_TASK),
+		}
+	}
+	return fmt.Errorf("cloud tasks operation failed (%d): %s", code, msg)
 }
