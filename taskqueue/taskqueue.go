@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/golang/protobuf/proto"
@@ -377,7 +378,9 @@ func Delete(c context.Context, task *Task, queueName string) error {
 // are successfully deleted.
 func DeleteMulti(c context.Context, tasks []*Task, queueName string) error {
 	if os.Getenv("GAE_PUSHQUEUE_BACKEND") == "CLOUD_TASK" {
-		return deleteMultiInCloudTasks(c, tasks, queueName)
+		if len(tasks) > 0 && tasks[0].Method != "PULL" && !strings.Contains(queueName, "pull") {
+			return deleteMultiInCloudTasks(c, tasks, queueName)
+		}
 	}
 	taskNames := make([][]byte, len(tasks))
 	for i, t := range tasks {
