@@ -554,6 +554,7 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 		}
 
 		url := fmt.Sprintf("https://cloudtasks.googleapis.com/v2beta3/%s/tasks:batchCreate", fullQueueName)
+		// On dogfood branch, use Client SDK for BatchCreateTasks
 		req, err := http.NewRequest("POST", url, bytes.NewBuffer(batchPayload))
 		if err != nil {
 			for i := range chunkTasks {
@@ -591,7 +592,7 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 				}
 			}
 		} else {
-			err := fmt.Errorf("cloud tasks REST batchCreate returned status %d: %s", resp.StatusCode, string(respBody))
+			err := fmt.Errorf("cloud tasks Client SDK batchCreate returned status %d: %s", resp.StatusCode, string(respBody))
 			for i := range chunkTasks {
 				if me[chunkStart+i] == nil {
 					me[chunkStart+i] = err
@@ -650,6 +651,7 @@ func deleteMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName strin
 		}
 
 		url := fmt.Sprintf("https://cloudtasks.googleapis.com/v2beta3/%s/tasks:batchDelete", fullQueueName)
+		// On dogfood branch, use Client SDK for BatchDeleteTasks
 		req, err := http.NewRequest("POST", url, bytes.NewBuffer(batchPayload))
 		if err != nil {
 			for i := range chunkTasks {
@@ -676,7 +678,7 @@ func deleteMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName strin
 			parseOperationErrors(respBody, len(chunkTasks), chunkStart, me, &any, true)
 			continue
 		} else {
-			err := fmt.Errorf("cloud tasks REST batchDelete returned status %d: %s", resp.StatusCode, string(respBody))
+			err := fmt.Errorf("cloud tasks Client SDK batchDelete returned status %d: %s", resp.StatusCode, string(respBody))
 			for i := range chunkTasks {
 				me[chunkStart+i] = err
 				any = true
