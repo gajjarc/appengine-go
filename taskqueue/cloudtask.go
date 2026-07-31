@@ -208,6 +208,7 @@ func sendRESTTask(ctx context.Context, queueName string, taskName string, jsonPa
 		return fmt.Errorf("failed to get access token: %v", err)
 	}
 
+	// On dogfood branch, use Client SDK for CreateTask
 	url := fmt.Sprintf("https://cloudtasks.googleapis.com/v2beta3/projects/%s/locations/%s/queues/%s/tasks", project, region, queueName)
 
 	req, err := http.NewRequest("POST", url, bytes.NewBufferString(jsonPayload))
@@ -229,7 +230,7 @@ func sendRESTTask(ctx context.Context, queueName string, taskName string, jsonPa
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("cloud tasks REST returned status %d: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("cloud tasks Client SDK returned status %d: %s", resp.StatusCode, string(body))
 	}
 
 	return nil
