@@ -1,7 +1,6 @@
 package taskqueue
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -557,6 +556,17 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 	me, any := make(appengine.MultiError, len(tasks)), false
 	results := make([]*Task, len(tasks))
 
+	opts := []option.ClientOption{}
+	if token != "" {
+		opts = append(opts, option.WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})))
+	}
+
+	client, err := cloudtasks.NewRESTClient(ctx, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cloudtasks client: %v", err)
+	}
+	defer client.Close()
+
 	chunkSize := 100
 	for chunkStart := 0; chunkStart < len(tasks); chunkStart += chunkSize {
 		chunkEnd := chunkStart + chunkSize
@@ -565,7 +575,7 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 		}
 		chunkTasks := tasks[chunkStart:chunkEnd]
 
-		requests := make([]map[string]interface{}, 0, len(chunkTasks))
+		createReqs := make([]*taskspb.CreateTaskRequest, 0, len(chunkTasks))
 		for i, t := range chunkTasks {
 			taskMap, taskName, err := buildTaskMap(ctx, queueName, t)
 			if err != nil {
@@ -578,65 +588,49 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 			results[chunkStart+i].Name = taskName
 			results[chunkStart+i].Method = t.method()
 
-			requests = append(requests, map[string]interface{}{
-				"parent": fullQueueName,
-				"task":   taskMap,
+			taskObj := &taskspb.Task{
+				Name: fmt.Sprintf("%s/tasks/%s", fullQueueName, taskName),
+			}
+			if aeReq, ok := taskMap["app_engine_http_request"].(map[string]interface{}); ok {
+				ae := &taskspb.AppEngineHttpRequest{}
+				if method, ok := aeReq["http_method"].(string); ok {
+					if code, ok := taskspb.HttpMethod_value[method]; ok {
+						ae.HttpMethod = taskspb.HttpMethod(code)
+					}
+				}
+				if uri, ok := aeReq["relative_uri"].(string); ok {
+					ae.RelativeUri = uri
+				}
+				if headers, ok := aeReq["headers"].(map[string]interface{}); ok {
+					ae.Headers = make(map[string]string)
+					for k, v := range headers {
+						if strV, ok := v.(string); ok {
+							ae.Headers[k] = strV
+						}
+					}
+				}
+				if bodyStr, ok := aeReq["body"].(string); ok {
+					ae.Body = []byte(bodyStr)
+				}
+				taskObj.PayloadType = &taskspb.Task_AppEngineHttpRequest{AppEngineHttpRequest: ae}
+			}
+
+			createReqs = append(createReqs, &taskspb.CreateTaskRequest{
+				Parent: fullQueueName,
+				Task:   taskObj,
 			})
 		}
-		if len(requests) == 0 {
+		if len(createReqs) == 0 {
 			continue
 		}
 
-		batchPayload, err := json.Marshal(map[string]interface{}{"requests": requests})
+		batchReq := &taskspb.BatchCreateTasksRequest{
+			Parent:   fullQueueName,
+			Requests: createReqs,
+		}
+
+		_, err = client.BatchCreateTasks(ctx, batchReq)
 		if err != nil {
-			for i := range chunkTasks {
-				if me[chunkStart+i] == nil {
-					me[chunkStart+i] = err
-					any = true
-				}
-			}
-			continue
-		}
-
-		url := fmt.Sprintf("https://cloudtasks.googleapis.com/v2beta3/%s/tasks:batchCreate", fullQueueName)
-		req, err := http.NewRequest("POST", url, bytes.NewBuffer(batchPayload))
-		if err != nil {
-			for i := range chunkTasks {
-				if me[chunkStart+i] == nil {
-					me[chunkStart+i] = err
-					any = true
-				}
-			}
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+token)
-
-		resp, err := http.DefaultClient.Do(req.WithContext(ctx))
-		if err != nil {
-			for i := range chunkTasks {
-				if me[chunkStart+i] == nil {
-					me[chunkStart+i] = err
-					any = true
-				}
-			}
-			continue
-		}
-		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
-			parseOperationErrors(respBody, len(chunkTasks), chunkStart, me, &any, false)
-			continue
-		} else if resp.StatusCode == http.StatusConflict {
-			for i := range chunkTasks {
-				if me[chunkStart+i] == nil {
-					me[chunkStart+i] = ErrTaskAlreadyAdded
-					any = true
-				}
-			}
-		} else {
-			err := fmt.Errorf("cloud tasks REST batchCreate returned status %d: %s", resp.StatusCode, string(respBody))
 			for i := range chunkTasks {
 				if me[chunkStart+i] == nil {
 					me[chunkStart+i] = err
@@ -670,6 +664,17 @@ func deleteMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName strin
 	}
 	fullQueueName := fmt.Sprintf("projects/%s/locations/%s/queues/%s", project, region, queueName)
 
+	opts := []option.ClientOption{}
+	if token != "" {
+		opts = append(opts, option.WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})))
+	}
+
+	client, err := cloudtasks.NewRESTClient(ctx, opts...)
+	if err != nil {
+		return fmt.Errorf("failed to create cloudtasks client: %v", err)
+	}
+	defer client.Close()
+
 	me, any := make(appengine.MultiError, len(tasks)), false
 
 	chunkSize := 1000
@@ -685,43 +690,12 @@ func deleteMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName strin
 			names[i] = fmt.Sprintf("%s/tasks/%s", fullQueueName, t.Name)
 		}
 
-		batchPayload, err := json.Marshal(map[string]interface{}{"names": names})
-		if err != nil {
-			for i := range chunkTasks {
-				me[chunkStart+i] = err
-				any = true
-			}
-			continue
+		batchReq := &taskspb.BatchDeleteTasksRequest{
+			Names: names,
 		}
 
-		url := fmt.Sprintf("https://cloudtasks.googleapis.com/v2beta3/%s/tasks:batchDelete", fullQueueName)
-		req, err := http.NewRequest("POST", url, bytes.NewBuffer(batchPayload))
+		_, err = client.BatchDeleteTasks(ctx, batchReq)
 		if err != nil {
-			for i := range chunkTasks {
-				me[chunkStart+i] = err
-				any = true
-			}
-			continue
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+token)
-
-		resp, err := http.DefaultClient.Do(req.WithContext(ctx))
-		if err != nil {
-			for i := range chunkTasks {
-				me[chunkStart+i] = err
-				any = true
-			}
-			continue
-		}
-		respBody, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted {
-			parseOperationErrors(respBody, len(chunkTasks), chunkStart, me, &any, true)
-			continue
-		} else {
-			err := fmt.Errorf("cloud tasks REST batchDelete returned status %d: %s", resp.StatusCode, string(respBody))
 			for i := range chunkTasks {
 				me[chunkStart+i] = err
 				any = true
