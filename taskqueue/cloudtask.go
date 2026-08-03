@@ -22,6 +22,13 @@ import (
 	taskspb "cloud.google.com/go/cloudtasks/apiv2beta3/cloudtaskspb"
 )
 
+const (
+	maxTaskPayloadBytes   = 100 * 1024 // 100 KB max payload size for Cloud Tasks
+	maxTransactionalTasks = 5          // Maximum tasks allowed in a single Datastore transaction
+	batchCreateChunkSize  = 100        // Maximum tasks per BatchCreateTasks request
+	batchDeleteChunkSize  = 1000       // Maximum tasks per BatchDeleteTasks request
+)
+
 var taskNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 func getQueuePath(ctx context.Context, queueName string) (string, error) {
@@ -136,7 +143,7 @@ func buildCloudTaskProto(ctx context.Context, queueName string, task *Task) (*ta
 		}
 	}
 
-	if len(task.Payload) > 100*1024 {
+	if len(task.Payload) > maxTaskPayloadBytes {
 		return nil, "", fmt.Errorf("taskqueue: task too large (%d bytes)", len(task.Payload))
 	}
 
@@ -221,7 +228,7 @@ func addInCloudTasks(ctx context.Context, task *Task, queueName string) (*Task, 
 	if t := internal.TransactionFromContext(ctx); t != nil {
 		handle := t.GetHandle()
 		pendingTasksMu.Lock()
-		if len(pendingTasks[handle]) >= 5 {
+		if len(pendingTasks[handle]) >= maxTransactionalTasks {
 			pendingTasksMu.Unlock()
 			return nil, &internal.APIError{
 				Service: "taskqueue",
@@ -281,7 +288,7 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 	if t := internal.TransactionFromContext(ctx); t != nil {
 		handle := t.GetHandle()
 		pendingTasksMu.Lock()
-		if len(pendingTasks[handle])+len(tasks) > 5 {
+		if len(pendingTasks[handle])+len(tasks) > maxTransactionalTasks {
 			pendingTasksMu.Unlock()
 			return nil, &internal.APIError{
 				Service: "taskqueue",
@@ -322,7 +329,7 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 	}
 	defer client.Close()
 
-	chunkSize := 100
+	chunkSize := batchCreateChunkSize
 	for chunkStart := 0; chunkStart < len(tasks); chunkStart += chunkSize {
 		chunkEnd := chunkStart + chunkSize
 		if chunkEnd > len(tasks) {
@@ -426,7 +433,7 @@ func deleteMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName strin
 
 	me, any := make(appengine.MultiError, len(tasks)), false
 
-	chunkSize := 1000
+	chunkSize := batchDeleteChunkSize
 	for chunkStart := 0; chunkStart < len(tasks); chunkStart += chunkSize {
 		chunkEnd := chunkStart + chunkSize
 		if chunkEnd > len(tasks) {

@@ -17,6 +17,19 @@ import (
 	taskspb "cloud.google.com/go/cloudtasks/apiv2beta3/cloudtaskspb"
 )
 
+const (
+	statusPending       = "PENDING"
+	statusProcessing    = "PROCESSING"
+	statusFailed        = "FAILED"
+	statusDone          = "DONE"
+	statusAlreadyExists = "ALREADY_EXISTS"
+
+	lockDuration        = 60 * time.Second
+	fastPathGracePeriod = 60 * time.Second
+	maxSweeperRetries   = 5
+	maxLastErrorLength  = 500
+)
+
 type PendingCloudTask struct {
 	QueueName        string    `datastore:"queue_name"`
 	CloudTaskName    string    `datastore:"cloud_task_name"`
@@ -100,8 +113,8 @@ func dispatchPendingTasks(ctx context.Context, handle uint64) {
 		}
 
 		now := time.Now()
-		taskEntity.Status = "PROCESSING"
-		taskEntity.LockExpires = now.Add(60 * time.Second)
+		taskEntity.Status = statusProcessing
+		taskEntity.LockExpires = now.Add(lockDuration)
 		taskEntity.HandledBySweeper = false
 		if _, err := datastore.Put(noCancelCtx, key, &taskEntity); err != nil {
 			logErrorf(ctx, "Failed to acquire lock in fast-path for task %s: %v", taskEntity.CloudTaskName, err)
@@ -122,10 +135,10 @@ func dispatchPendingTasks(ctx context.Context, handle uint64) {
 			logErrorf(ctx, "Failed to dispatch task %s to queue %s: %v", taskEntity.CloudTaskName, taskEntity.QueueName, err)
 			taskEntity.RetryCount++
 			taskEntity.LastError = err.Error()
-			if len(taskEntity.LastError) > 500 {
-				taskEntity.LastError = taskEntity.LastError[:500]
+			if len(taskEntity.LastError) > maxLastErrorLength {
+				taskEntity.LastError = taskEntity.LastError[:maxLastErrorLength]
 			}
-			taskEntity.Status = "PENDING"
+			taskEntity.Status = statusPending
 			datastore.Put(noCancelCtx, key, &taskEntity)
 			continue
 		}
@@ -149,26 +162,26 @@ func sweep(ctx context.Context) error {
 	count := 0
 	for i, key := range keys {
 		task := tasks[i]
-		if task.Status == "DONE" || task.Status == "ALREADY_EXISTS" {
+		if task.Status == statusDone || task.Status == statusAlreadyExists {
 			continue
 		}
-		if task.Status == "PROCESSING" {
+		if task.Status == statusProcessing {
 			if !task.LockExpires.IsZero() && now.Before(task.LockExpires) {
 				continue // Still actively processing and lock valid
 			} else if task.LockExpires.IsZero() {
 				continue // Assume lock valid if just started
 			}
-		} else if task.Status == "PENDING" || task.Status == "" {
-			if !task.Created.IsZero() && now.Sub(task.Created) < 60*time.Second {
-				continue // Give fast-path 60s to dispatch post-commit
+		} else if task.Status == statusPending || task.Status == "" {
+			if !task.Created.IsZero() && now.Sub(task.Created) < fastPathGracePeriod {
+				continue // Give fast-path grace period to dispatch post-commit
 			}
-		} else if task.Status == "FAILED" && task.RetryCount >= 5 {
+		} else if task.Status == statusFailed && task.RetryCount >= maxSweeperRetries {
 			continue // Exceeded max sweeper retries
 		}
 
 		// Acquire lock
-		task.Status = "PROCESSING"
-		task.LockExpires = now.Add(60 * time.Second)
+		task.Status = statusProcessing
+		task.LockExpires = now.Add(lockDuration)
 		task.HandledBySweeper = true
 		if _, err := datastore.Put(ctx, key, &task); err != nil {
 			logErrorf(ctx, "Sweeper failed to acquire lock for task %s: %v", task.CloudTaskName, err)
@@ -185,14 +198,14 @@ func sweep(ctx context.Context) error {
 			logErrorf(ctx, "Sweeper failed to dispatch task %s: %v", task.CloudTaskName, err)
 			task.RetryCount++
 			task.LastError = err.Error()
-			if len(task.LastError) > 500 {
-				task.LastError = task.LastError[:500]
+			if len(task.LastError) > maxLastErrorLength {
+				task.LastError = task.LastError[:maxLastErrorLength]
 			}
-			if task.RetryCount >= 5 {
-				task.Status = "FAILED"
+			if task.RetryCount >= maxSweeperRetries {
+				task.Status = statusFailed
 				task.LockExpires = time.Time{}
 			} else {
-				task.Status = "PENDING"
+				task.Status = statusPending
 				task.LockExpires = time.Time{}
 			}
 			if _, putErr := datastore.Put(ctx, key, &task); putErr != nil {
