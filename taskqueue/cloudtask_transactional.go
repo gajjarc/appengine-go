@@ -12,6 +12,9 @@ import (
 	"google.golang.org/appengine"
 	"google.golang.org/appengine/datastore"
 	"google.golang.org/appengine/internal"
+	"google.golang.org/protobuf/proto"
+
+	taskspb "cloud.google.com/go/cloudtasks/apiv2beta3/cloudtaskspb"
 )
 
 type PendingCloudTask struct {
@@ -105,7 +108,12 @@ func dispatchPendingTasks(ctx context.Context, handle uint64) {
 			continue
 		}
 
-		_, err = sendTask(noCancelCtx, taskEntity.QueueName, taskEntity.CloudTaskName, taskEntity.CloudTaskPayload)
+		var taskObj taskspb.Task
+		if err := proto.Unmarshal([]byte(taskEntity.CloudTaskPayload), &taskObj); err != nil {
+			logErrorf(ctx, "Failed to unmarshal pending task proto: %v", err)
+			continue
+		}
+		_, err = sendTask(noCancelCtx, taskEntity.QueueName, taskEntity.CloudTaskName, &taskObj)
 		if err != nil {
 			if err == ErrTaskAlreadyAdded {
 				datastore.Delete(noCancelCtx, key)
@@ -167,7 +175,12 @@ func sweep(ctx context.Context) error {
 			continue
 		}
 
-		_, err := sendTask(ctx, task.QueueName, task.CloudTaskName, task.CloudTaskPayload)
+		var taskObj taskspb.Task
+		if err := proto.Unmarshal([]byte(task.CloudTaskPayload), &taskObj); err != nil {
+			logErrorf(ctx, "Sweeper failed to unmarshal pending task proto: %v", err)
+			continue
+		}
+		_, err := sendTask(ctx, task.QueueName, task.CloudTaskName, &taskObj)
 		if err != nil && err != ErrTaskAlreadyAdded {
 			logErrorf(ctx, "Sweeper failed to dispatch task %s: %v", task.CloudTaskName, err)
 			task.RetryCount++

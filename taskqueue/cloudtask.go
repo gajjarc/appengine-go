@@ -2,8 +2,6 @@ package taskqueue
 
 import (
 	"context"
-	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +14,8 @@ import (
 	"google.golang.org/appengine/datastore"
 	"google.golang.org/appengine/internal"
 	pb "google.golang.org/appengine/internal/taskqueue"
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	cloudtasks "cloud.google.com/go/cloudtasks/apiv2beta3"
 	taskspb "cloud.google.com/go/cloudtasks/apiv2beta3/cloudtaskspb"
@@ -79,7 +79,7 @@ func getRegion(ctx context.Context) (string, error) {
 	return parts[len(parts)-1], nil
 }
 
-func sendTask(ctx context.Context, queueName string, taskName string, jsonPayload string) (string, error) {
+func sendTask(ctx context.Context, queueName string, taskName string, taskObj *taskspb.Task) (string, error) {
 	project := appengine.AppID(ctx)
 	if idx := strings.Index(project, "~"); idx != -1 {
 		project = project[idx+1:]
@@ -108,52 +108,9 @@ func sendTask(ctx context.Context, queueName string, taskName string, jsonPayloa
 
 	parent := fmt.Sprintf("projects/%s/locations/%s/queues/%s", project, region, queueName)
 
-	var taskMap map[string]interface{}
-	_ = json.Unmarshal([]byte(jsonPayload), &taskMap)
-
 	req := &taskspb.CreateTaskRequest{
 		Parent: parent,
-	}
-
-	if t, ok := taskMap["task"].(map[string]interface{}); ok {
-		taskObj := &taskspb.Task{}
-		if name, ok := t["name"].(string); ok && name != "" {
-			taskObj.Name = name
-		}
-		if aeReq, ok := t["app_engine_http_request"].(map[string]interface{}); ok {
-			ae := &taskspb.AppEngineHttpRequest{}
-			if method, ok := aeReq["http_method"].(string); ok {
-				if code, ok := taskspb.HttpMethod_value[method]; ok {
-					ae.HttpMethod = taskspb.HttpMethod(code)
-				}
-			}
-			if uri, ok := aeReq["relative_uri"].(string); ok {
-				ae.RelativeUri = uri
-			}
-			if headers, ok := aeReq["headers"].(map[string]interface{}); ok {
-				ae.Headers = make(map[string]string)
-				for k, v := range headers {
-					if strV, ok := v.(string); ok {
-						ae.Headers[k] = strV
-					}
-				}
-			}
-			if bodyStr, ok := aeReq["body"].(string); ok {
-				if bodyBytes, err := base64.StdEncoding.DecodeString(bodyStr); err == nil {
-					ae.Body = bodyBytes
-				} else {
-					ae.Body = []byte(bodyStr)
-				}
-			}
-			if routing, ok := aeReq["app_engine_routing"].(map[string]interface{}); ok {
-				ae.AppEngineRouting = &taskspb.AppEngineRouting{}
-				if svc, ok := routing["service"].(string); ok {
-					ae.AppEngineRouting.Service = svc
-				}
-			}
-			taskObj.PayloadType = &taskspb.Task_AppEngineHttpRequest{AppEngineHttpRequest: ae}
-		}
-		req.Task = taskObj
+		Task:   taskObj,
 	}
 
 	createdTask, err := client.CreateTask(ctx, req)
@@ -191,10 +148,8 @@ func extractServiceFromHost(ctx context.Context, host string) string {
 		project = project[idx+1:]
 	}
 
-	// Find the domain suffix starting from the project ID
 	pIdx := strings.Index(host, project)
 	if pIdx == -1 {
-		// Fallback to defaultHost check if project ID not found in host
 		defaultHost := appengine.DefaultVersionHostname(ctx)
 		if host == defaultHost {
 			return "default"
@@ -231,7 +186,7 @@ func extractServiceFromHost(ctx context.Context, host string) string {
 	return "default"
 }
 
-func buildTaskMap(ctx context.Context, queueName string, task *Task) (map[string]interface{}, string, error) {
+func buildCloudTaskProto(ctx context.Context, queueName string, task *Task) (*taskspb.Task, string, error) {
 	if task.Name != "" {
 		if !taskNameRegex.MatchString(task.Name) {
 			return nil, "", fmt.Errorf("taskqueue: invalid task name %q", task.Name)
@@ -283,26 +238,23 @@ func buildTaskMap(ctx context.Context, queueName string, task *Task) (map[string
 	}
 
 	targetService := extractServiceFromHost(ctx, headers["Host"])
-	routing := map[string]string{
-		"service": targetService,
+	ae := &taskspb.AppEngineHttpRequest{
+		RelativeUri: path,
+		Headers:     headers,
+		Body:        task.Payload,
+		AppEngineRouting: &taskspb.AppEngineRouting{
+			Service: targetService,
+		},
+	}
+	if code, ok := taskspb.HttpMethod_value[task.method()]; ok {
+		ae.HttpMethod = taskspb.HttpMethod(code)
 	}
 
-	aeReq := map[string]interface{}{
-		"http_method":        task.method(),
-		"relative_uri":       path,
-		"headers":             headers,
-		"app_engine_routing": routing,
-	}
-
-	if len(task.Payload) > 0 {
-		aeReq["body"] = base64.StdEncoding.EncodeToString(task.Payload)
-	}
-
-	taskMap := map[string]interface{}{
-		"app_engine_http_request": aeReq,
-	}
-	if fullTaskName != "" {
-		taskMap["name"] = fullTaskName
+	taskObj := &taskspb.Task{
+		Name: fullTaskName,
+		PayloadType: &taskspb.Task_AppEngineHttpRequest{
+			AppEngineHttpRequest: ae,
+		},
 	}
 
 	eta := task.ETA
@@ -312,51 +264,10 @@ func buildTaskMap(ctx context.Context, queueName string, task *Task) (map[string
 		}
 	}
 	if !eta.IsZero() {
-		taskMap["scheduleTime"] = eta.UTC().Format(time.RFC3339Nano)
+		taskObj.ScheduleTime = timestamppb.New(eta)
 	}
 
-	if task.RetryOptions != nil {
-		rc := make(map[string]interface{})
-		ro := task.RetryOptions
-		if ro.RetryLimit > 0 {
-			rc["maxAttempts"] = ro.RetryLimit + 1
-		}
-		if ro.AgeLimit > 0 {
-			rc["maxRetryDuration"] = fmt.Sprintf("%.3fs", ro.AgeLimit.Seconds())
-		}
-		if ro.MinBackoff > 0 {
-			rc["minBackoff"] = fmt.Sprintf("%.3fs", ro.MinBackoff.Seconds())
-		}
-		if ro.MaxBackoff > 0 {
-			rc["maxBackoff"] = fmt.Sprintf("%.3fs", ro.MaxBackoff.Seconds())
-		}
-		if ro.MaxDoublings > 0 || (ro.MaxDoublings == 0 && ro.ApplyZeroMaxDoublings) {
-			rc["maxDoublings"] = ro.MaxDoublings
-		}
-		if len(rc) > 0 {
-			taskMap["retryConfig"] = rc
-		}
-	}
-
-	return taskMap, taskName, nil
-}
-
-func serializeTaskPayload(ctx context.Context, queueName string, task *Task) (string, string, error) {
-	taskMap, taskName, err := buildTaskMap(ctx, queueName, task)
-	if err != nil {
-		return "", "", err
-	}
-
-	reqMap := map[string]interface{}{
-		"task": taskMap,
-	}
-
-	jsonBytes, err := json.Marshal(reqMap)
-	if err != nil {
-		return "", "", err
-	}
-
-	return string(jsonBytes), taskName, nil
+	return taskObj, taskName, nil
 }
 
 func addInCloudTasks(ctx context.Context, task *Task, queueName string) (*Task, error) {
@@ -364,17 +275,21 @@ func addInCloudTasks(ctx context.Context, task *Task, queueName string) (*Task, 
 		queueName = "default"
 	}
 
-	payload, taskName, err := serializeTaskPayload(ctx, queueName, task)
+	taskObj, taskName, err := buildCloudTaskProto(ctx, queueName, task)
 	if err != nil {
 		return nil, err
 	}
 
 	if t := internal.TransactionFromContext(ctx); t != nil {
+		protoBytes, err := proto.Marshal(taskObj)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal proto for transactional task: %v", err)
+		}
 		key := datastore.NewIncompleteKey(ctx, "_AE_PendingCloudTask", nil)
 		pendingTask := &PendingCloudTask{
 			QueueName:        queueName,
 			CloudTaskName:    taskName,
-			CloudTaskPayload: payload,
+			CloudTaskPayload: string(protoBytes),
 			Created:          time.Now(),
 			Status:           "PENDING",
 			RetryCount:       0,
@@ -398,7 +313,7 @@ func addInCloudTasks(ctx context.Context, task *Task, queueName string) (*Task, 
 		return &resultTask, nil
 	}
 
-	assignedName, err := sendTask(ctx, queueName, taskName, payload)
+	assignedName, err := sendTask(ctx, queueName, taskName, taskObj)
 	if err != nil {
 		return nil, err
 	}
@@ -469,7 +384,7 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 
 		createReqs := make([]*taskspb.CreateTaskRequest, 0, len(chunkTasks))
 		for i, t := range chunkTasks {
-			taskMap, taskName, err := buildTaskMap(ctx, queueName, t)
+			taskObj, taskName, err := buildCloudTaskProto(ctx, queueName, t)
 			if err != nil {
 				me[chunkStart+i] = err
 				any = true
@@ -479,34 +394,6 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 			*results[chunkStart+i] = *t
 			results[chunkStart+i].Name = taskName
 			results[chunkStart+i].Method = t.method()
-
-			taskObj := &taskspb.Task{}
-			if taskName != "" {
-				taskObj.Name = fmt.Sprintf("%s/tasks/%s", fullQueueName, taskName)
-			}
-			if aeReq, ok := taskMap["app_engine_http_request"].(map[string]interface{}); ok {
-				ae := &taskspb.AppEngineHttpRequest{}
-				if method, ok := aeReq["http_method"].(string); ok {
-					if code, ok := taskspb.HttpMethod_value[method]; ok {
-						ae.HttpMethod = taskspb.HttpMethod(code)
-					}
-				}
-				if uri, ok := aeReq["relative_uri"].(string); ok {
-					ae.RelativeUri = uri
-				}
-				if headers, ok := aeReq["headers"].(map[string]interface{}); ok {
-					ae.Headers = make(map[string]string)
-					for k, v := range headers {
-						if strV, ok := v.(string); ok {
-							ae.Headers[k] = strV
-						}
-					}
-				}
-				if bodyStr, ok := aeReq["body"].(string); ok {
-					ae.Body = []byte(bodyStr)
-				}
-				taskObj.PayloadType = &taskspb.Task_AppEngineHttpRequest{AppEngineHttpRequest: ae}
-			}
 
 			createReqs = append(createReqs, &taskspb.CreateTaskRequest{
 				Parent: fullQueueName,
