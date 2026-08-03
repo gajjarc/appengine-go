@@ -27,9 +27,45 @@ const (
 	maxTransactionalTasks = 5          // Maximum tasks allowed in a single Datastore transaction
 	batchCreateChunkSize  = 100        // Maximum tasks per BatchCreateTasks request
 	batchDeleteChunkSize  = 1000       // Maximum tasks per BatchDeleteTasks request
+
+	grpcNotFound      = 5
+	grpcAlreadyExists = 6
+	httpNotFound      = 404
+	httpAlreadyExists = 409
 )
 
-var taskNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+var (
+	taskNameRegex                = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+	ErrTooManyTasksInTransaction = &internal.APIError{
+		Service: "taskqueue",
+		Detail:  "too many tasks in transaction",
+		Code:    int32(pb.TaskQueueServiceError_TOO_MANY_TASKS_IN_TRANSACTION),
+	}
+)
+
+func newUnknownTaskError(detail string) error {
+	return &internal.APIError{
+		Service: "taskqueue",
+		Detail:  detail,
+		Code:    int32(pb.TaskQueueServiceError_UNKNOWN_TASK),
+	}
+}
+
+func isAlreadyExistsError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "AlreadyExists") || strings.Contains(msg, "already exists") || strings.Contains(msg, "409")
+}
+
+func isUnimplementedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "Unimplemented") || strings.Contains(msg, "unknown method") || strings.Contains(msg, "404")
+}
 
 func getQueuePath(ctx context.Context, queueName string) (string, error) {
 	if queueName == "" {
@@ -65,7 +101,7 @@ func sendTask(ctx context.Context, queueName string, taskName string, taskObj *t
 
 	createdTask, err := client.CreateTask(ctx, req)
 	if err != nil {
-		if strings.Contains(err.Error(), "AlreadyExists") || strings.Contains(err.Error(), "409") {
+		if isAlreadyExistsError(err) {
 			return "", ErrTaskAlreadyAdded
 		}
 		return "", err
@@ -230,11 +266,7 @@ func addInCloudTasks(ctx context.Context, task *Task, queueName string) (*Task, 
 		pendingTasksMu.Lock()
 		if len(pendingTasks[handle]) >= maxTransactionalTasks {
 			pendingTasksMu.Unlock()
-			return nil, &internal.APIError{
-				Service: "taskqueue",
-				Detail:  "too many tasks in transaction",
-				Code:    int32(pb.TaskQueueServiceError_TOO_MANY_TASKS_IN_TRANSACTION),
-			}
+			return nil, ErrTooManyTasksInTransaction
 		}
 		pendingTasksMu.Unlock()
 
@@ -290,11 +322,7 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 		pendingTasksMu.Lock()
 		if len(pendingTasks[handle])+len(tasks) > maxTransactionalTasks {
 			pendingTasksMu.Unlock()
-			return nil, &internal.APIError{
-				Service: "taskqueue",
-				Detail:  "too many tasks in transaction",
-				Code:    int32(pb.TaskQueueServiceError_TOO_MANY_TASKS_IN_TRANSACTION),
-			}
+			return nil, ErrTooManyTasksInTransaction
 		}
 		pendingTasksMu.Unlock()
 
@@ -366,7 +394,7 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 
 		op, err := client.BatchCreateTasks(ctx, batchReq)
 		if err != nil {
-			if strings.Contains(err.Error(), "Unimplemented") || strings.Contains(err.Error(), "unknown method") || strings.Contains(err.Error(), "404") {
+			if isUnimplementedError(err) {
 				for i, t := range chunkTasks {
 					if me[chunkStart+i] != nil {
 						continue
@@ -479,72 +507,19 @@ func deleteMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName strin
 
 
 
-type operationResponse struct {
-	Error *struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-	} `json:"error"`
-	Metadata *struct {
-		FailedRequests      map[string]struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"failedRequests"`
-		FailedRequestsSnake map[string]struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"failed_requests"`
-	} `json:"metadata"`
-}
-
-func parseOperationErrors(respBody []byte, totalTasks int, chunkStart int, me appengine.MultiError, any *bool, isDelete bool) {
-	var opResp operationResponse
-	if err := json.Unmarshal(respBody, &opResp); err != nil {
-		return
-	}
-	if opResp.Error != nil && opResp.Error.Code != 0 {
-		err := mapOperationErrorCode(opResp.Error.Code, opResp.Error.Message, isDelete)
-		for i := 0; i < totalTasks; i++ {
-			if me[chunkStart+i] == nil {
-				me[chunkStart+i] = err
-				*any = true
-			}
-		}
-		return
-	}
-	if opResp.Metadata != nil {
-		failedReqs := opResp.Metadata.FailedRequests
-		if len(failedReqs) == 0 {
-			failedReqs = opResp.Metadata.FailedRequestsSnake
-		}
-		for idxStr, fail := range failedReqs {
-			var idx int
-			if _, err := fmt.Sscanf(idxStr, "%d", &idx); err == nil && idx >= 0 && idx < totalTasks {
-				if me[chunkStart+idx] == nil {
-					me[chunkStart+idx] = mapOperationErrorCode(fail.Code, fail.Message, isDelete)
-					*any = true
-				}
-			}
-		}
-	}
-}
-
 func mapOperationErrorCode(code int, msg string, isDelete bool) error {
-	if isDelete && (code == 5 || code == 404 || strings.Contains(strings.ToLower(msg), "not found") || strings.Contains(strings.ToLower(msg), "unknown")) {
-		return &internal.APIError{
-			Service: "taskqueue",
-			Detail:  msg,
-			Code:    int32(pb.TaskQueueServiceError_UNKNOWN_TASK),
-		}
+	lowerMsg := strings.ToLower(msg)
+	isNotFound := code == grpcNotFound || code == httpNotFound || strings.Contains(lowerMsg, "not found") || strings.Contains(lowerMsg, "unknown")
+	isAlreadyExists := code == grpcAlreadyExists || code == httpAlreadyExists || strings.Contains(lowerMsg, "already exists")
+
+	if isDelete && isNotFound {
+		return newUnknownTaskError(msg)
 	}
-	if code == 6 || code == 409 || strings.Contains(strings.ToLower(msg), "already exists") || ((code == 5 || code == 404) && strings.Contains(strings.ToLower(msg), "requested entity was not found")) {
+	if isAlreadyExists || (isNotFound && strings.Contains(lowerMsg, "requested entity was not found")) {
 		return ErrTaskAlreadyAdded
 	}
-	if code == 5 || code == 404 {
-		return &internal.APIError{
-			Service: "taskqueue",
-			Detail:  msg,
-			Code:    int32(pb.TaskQueueServiceError_UNKNOWN_TASK),
-		}
+	if isNotFound {
+		return newUnknownTaskError(msg)
 	}
 	return fmt.Errorf("cloud tasks operation failed (%d): %s", code, msg)
 }
