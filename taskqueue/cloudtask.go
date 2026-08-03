@@ -195,14 +195,10 @@ func buildCloudTaskProto(ctx context.Context, queueName string, task *Task) (*ta
 		},
 	}
 
-	eta := task.ETA
-	if eta.IsZero() {
-		if task.Delay > 0 {
-			eta = time.Now().Add(task.Delay)
-		}
-	}
-	if !eta.IsZero() {
-		taskObj.ScheduleTime = timestamppb.New(eta)
+	if !task.ETA.IsZero() {
+		taskObj.ScheduleTime = timestamppb.New(task.ETA)
+	} else if task.Delay > 0 {
+		taskObj.ScheduleTime = timestamppb.New(time.Now().Add(task.Delay))
 	}
 
 	return taskObj, taskName, nil
