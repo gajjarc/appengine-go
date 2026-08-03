@@ -553,15 +553,6 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 			}
 		}
 	}
-		if err != nil {
-			for i := range chunkTasks {
-				if me[chunkStart+i] == nil {
-					me[chunkStart+i] = err
-					any = true
-				}
-			}
-		}
-	}
 
 	if any {
 		return results, me
