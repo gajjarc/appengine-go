@@ -2,7 +2,6 @@ package taskqueue
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -39,7 +38,7 @@ var (
 	ErrTooManyTasksInTransaction = &internal.APIError{
 		Service: "taskqueue",
 		Detail:  "too many tasks in transaction",
-		Code:    int32(pb.TaskQueueServiceError_TOO_MANY_TASKS_IN_TRANSACTION),
+		Code:    int32(pb.TaskQueueServiceError_TOO_MANY_TASKS),
 	}
 )
 
@@ -80,6 +79,31 @@ func getQueuePath(ctx context.Context, queueName string) (string, error) {
 		return "", fmt.Errorf("failed to get region: %v", err)
 	}
 	return fmt.Sprintf("projects/%s/locations/%s/queues/%s", project, region, queueName), nil
+}
+
+func getRegion(ctx context.Context) (string, error) {
+	req, err := http.NewRequest("GET", "http://metadata.google.internal/computeMetadata/v1/instance/region", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Metadata-Flavor", "Google")
+	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("metadata server returned status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	parts := strings.Split(strings.TrimSpace(string(body)), "/")
+	if len(parts) == 0 {
+		return "", fmt.Errorf("invalid region format: %s", string(body))
+	}
+	return parts[len(parts)-1], nil
 }
 
 func sendTask(ctx context.Context, queueName string, taskName string, taskObj *taskspb.Task) (string, error) {
@@ -291,8 +315,6 @@ func addInCloudTasks(ctx context.Context, task *Task, queueName string) (*Task, 
 			return nil, fmt.Errorf("failed to save transactional task to Datastore: %v", err)
 		}
 
-		handle := t.GetHandle()
-		pendingTasksMu.Lock()
 		pendingTasks[handle] = append(pendingTasks[handle], key.Encode())
 		pendingTasksMu.Unlock()
 
@@ -419,9 +441,8 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 			meta, _ := op.Metadata()
 			resp, _ := op.Wait(ctx)
 			for i := range chunkTasks {
-				idxStr := fmt.Sprintf("%d", i)
 				if meta != nil && meta.FailedRequests != nil {
-					if st, failed := meta.FailedRequests[idxStr]; failed && st != nil && st.Code != 0 {
+					if st, failed := meta.FailedRequests[int32(i)]; failed && st != nil && st.Code != 0 {
 						me[chunkStart+i] = mapOperationErrorCode(int(st.Code), st.Message, false)
 						any = true
 						continue
@@ -488,9 +509,8 @@ func deleteMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName strin
 		} else if op != nil {
 			meta, _ := op.Metadata()
 			for i := range chunkTasks {
-				idxStr := fmt.Sprintf("%d", i)
 				if meta != nil && meta.FailedRequests != nil {
-					if st, failed := meta.FailedRequests[idxStr]; failed && st != nil && st.Code != 0 {
+					if st, failed := meta.FailedRequests[int32(i)]; failed && st != nil && st.Code != 0 {
 						me[chunkStart+i] = mapOperationErrorCode(int(st.Code), st.Message, true)
 						any = true
 					}
