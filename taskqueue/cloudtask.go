@@ -695,7 +695,8 @@ func deleteMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName strin
 		}
 
 		batchReq := &taskspb.BatchDeleteTasksRequest{
-			Names: names,
+			Parent: fullQueueName,
+			Names:  names,
 		}
 
 		_, err = client.BatchDeleteTasks(ctx, batchReq)
