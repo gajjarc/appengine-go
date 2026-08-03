@@ -219,6 +219,18 @@ func addInCloudTasks(ctx context.Context, task *Task, queueName string) (*Task, 
 	// we stage the task as a _AE_PendingCloudTask entity in Datastore under the transaction.
 	// When the transaction commits, PostCommitHook dispatches the staged task to Cloud Tasks.
 	if t := internal.TransactionFromContext(ctx); t != nil {
+		handle := t.GetHandle()
+		pendingTasksMu.Lock()
+		if len(pendingTasks[handle]) >= 5 {
+			pendingTasksMu.Unlock()
+			return nil, &internal.APIError{
+				Service: "taskqueue",
+				Detail:  "too many tasks in transaction",
+				Code:    int32(pb.TaskQueueServiceError_TOO_MANY_TASKS_IN_TRANSACTION),
+			}
+		}
+		pendingTasksMu.Unlock()
+
 		protoBytes, err := proto.Marshal(taskObj)
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal proto for transactional task: %v", err)
@@ -266,7 +278,19 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 	// If AddMulti is called inside a Datastore transaction, each task in the batch
 	// is transactionally staged in Datastore via addInCloudTasks so that all tasks
 	// commit atomically with the Datastore transaction.
-	if internal.TransactionFromContext(ctx) != nil {
+	if t := internal.TransactionFromContext(ctx); t != nil {
+		handle := t.GetHandle()
+		pendingTasksMu.Lock()
+		if len(pendingTasks[handle])+len(tasks) > 5 {
+			pendingTasksMu.Unlock()
+			return nil, &internal.APIError{
+				Service: "taskqueue",
+				Detail:  "too many tasks in transaction",
+				Code:    int32(pb.TaskQueueServiceError_TOO_MANY_TASKS_IN_TRANSACTION),
+			}
+		}
+		pendingTasksMu.Unlock()
+
 		me, any := make(appengine.MultiError, len(tasks)), false
 		results := make([]*Task, len(tasks))
 		for i, task := range tasks {
