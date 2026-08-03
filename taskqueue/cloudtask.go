@@ -214,6 +214,10 @@ func addInCloudTasks(ctx context.Context, task *Task, queueName string) (*Task, 
 		return nil, err
 	}
 
+	// In App Engine Datastore, external HTTP/gRPC Cloud Tasks RPCs cannot participate
+	// in Datastore 2PC transactions. If we are running inside an active Datastore transaction,
+	// we stage the task as a _AE_PendingCloudTask entity in Datastore under the transaction.
+	// When the transaction commits, PostCommitHook dispatches the staged task to Cloud Tasks.
 	if t := internal.TransactionFromContext(ctx); t != nil {
 		protoBytes, err := proto.Marshal(taskObj)
 		if err != nil {
@@ -259,6 +263,9 @@ func addInCloudTasks(ctx context.Context, task *Task, queueName string) (*Task, 
 }
 
 func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) ([]*Task, error) {
+	// If AddMulti is called inside a Datastore transaction, each task in the batch
+	// is transactionally staged in Datastore via addInCloudTasks so that all tasks
+	// commit atomically with the Datastore transaction.
 	if internal.TransactionFromContext(ctx) != nil {
 		me, any := make(appengine.MultiError, len(tasks)), false
 		results := make([]*Task, len(tasks))
@@ -326,7 +333,7 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 			Requests: createReqs,
 		}
 
-		_, err = client.BatchCreateTasks(ctx, batchReq)
+		op, err := client.BatchCreateTasks(ctx, batchReq)
 		if err != nil {
 			if strings.Contains(err.Error(), "Unimplemented") || strings.Contains(err.Error(), "unknown method") || strings.Contains(err.Error(), "404") {
 				for i, t := range chunkTasks {
@@ -342,7 +349,35 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 					}
 				}
 			} else {
-				parseOperationErrors([]byte(err.Error()), len(chunkTasks), chunkStart, me, &any, false)
+				for i := range chunkTasks {
+					if me[chunkStart+i] == nil {
+						me[chunkStart+i] = err
+						any = true
+					}
+				}
+			}
+		} else if op != nil {
+			meta, _ := op.Metadata()
+			resp, _ := op.Wait(ctx)
+			for i := range chunkTasks {
+				idxStr := fmt.Sprintf("%d", i)
+				if meta != nil && meta.FailedRequests != nil {
+					if st, failed := meta.FailedRequests[idxStr]; failed && st != nil && st.Code != 0 {
+						me[chunkStart+i] = mapOperationErrorCode(int(st.Code), st.Message, false)
+						any = true
+						continue
+					}
+				}
+				if resp != nil && i < len(resp.Tasks) && resp.Tasks[i] != nil {
+					createdTask := resp.Tasks[i]
+					if createdTask.Name != "" && results[chunkStart+i] != nil {
+						if idx := strings.LastIndex(createdTask.Name, "/"); idx != -1 {
+							results[chunkStart+i].Name = createdTask.Name[idx+1:]
+						} else {
+							results[chunkStart+i].Name = createdTask.Name
+						}
+					}
+				}
 			}
 		}
 	}
@@ -385,11 +420,22 @@ func deleteMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName strin
 			Names:  names,
 		}
 
-		_, err = client.BatchDeleteTasks(ctx, batchReq)
+		op, err := client.BatchDeleteTasks(ctx, batchReq)
 		if err != nil {
 			for i := range chunkTasks {
 				me[chunkStart+i] = err
 				any = true
+			}
+		} else if op != nil {
+			meta, _ := op.Metadata()
+			for i := range chunkTasks {
+				idxStr := fmt.Sprintf("%d", i)
+				if meta != nil && meta.FailedRequests != nil {
+					if st, failed := meta.FailedRequests[idxStr]; failed && st != nil && st.Code != 0 {
+						me[chunkStart+i] = mapOperationErrorCode(int(st.Code), st.Message, true)
+						any = true
+					}
+				}
 			}
 		}
 	}
