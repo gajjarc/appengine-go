@@ -522,7 +522,7 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 			Requests: createReqs,
 		}
 
-		op, err := client.BatchCreateTasks(ctx, batchReq)
+		_, err = client.BatchCreateTasks(ctx, batchReq)
 		if err != nil {
 			if strings.Contains(err.Error(), "Unimplemented") || strings.Contains(err.Error(), "unknown method") || strings.Contains(err.Error(), "404") {
 				for i, t := range chunkTasks {
@@ -539,19 +539,6 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 				}
 			} else {
 				parseOperationErrors([]byte(err.Error()), len(chunkTasks), chunkStart, me, &any, false)
-			}
-		} else if op != nil {
-			resp, waitErr := op.Wait(ctx)
-			if waitErr == nil && resp != nil {
-				for i, createdTask := range resp.Tasks {
-					if createdTask != nil && createdTask.Name != "" && results[chunkStart+i] != nil {
-						if idx := strings.LastIndex(createdTask.Name, "/"); idx != -1 {
-							results[chunkStart+i].Name = createdTask.Name[idx+1:]
-						} else {
-							results[chunkStart+i].Name = createdTask.Name
-						}
-					}
-				}
 			}
 		}
 	}
