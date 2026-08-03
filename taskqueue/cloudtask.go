@@ -140,12 +140,7 @@ func buildCloudTaskProto(ctx context.Context, queueName string, task *Task) (*ta
 		return nil, "", fmt.Errorf("taskqueue: task too large (%d bytes)", len(task.Payload))
 	}
 
-	project := appengine.AppID(ctx)
-	if idx := strings.Index(project, "~"); idx != -1 {
-		project = project[idx+1:]
-	}
-
-	region, err := getRegion(ctx)
+	queuePath, err := getQueuePath(ctx, queueName)
 	if err != nil {
 		return nil, "", err
 	}
@@ -153,7 +148,7 @@ func buildCloudTaskProto(ctx context.Context, queueName string, task *Task) (*ta
 	taskName := task.Name
 	var fullTaskName string
 	if taskName != "" {
-		fullTaskName = fmt.Sprintf("projects/%s/locations/%s/queues/%s/tasks/%s", project, region, queueName, taskName)
+		fullTaskName = fmt.Sprintf("%s/tasks/%s", queuePath, taskName)
 	}
 
 	path := task.Path
