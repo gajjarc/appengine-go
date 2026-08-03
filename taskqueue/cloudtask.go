@@ -82,7 +82,7 @@ func getRegion(ctx context.Context) (string, error) {
 	return parts[len(parts)-1], nil
 }
 
-func sendRESTTask(ctx context.Context, queueName string, taskName string, jsonPayload string) error {
+func sendTask(ctx context.Context, queueName string, taskName string, jsonPayload string) error {
 	project := appengine.AppID(ctx)
 	if idx := strings.Index(project, "~"); idx != -1 {
 		project = project[idx+1:]
@@ -103,7 +103,7 @@ func sendRESTTask(ctx context.Context, queueName string, taskName string, jsonPa
 		opts = append(opts, option.WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})))
 	}
 
-	client, err := cloudtasks.NewRESTClient(ctx, opts...)
+	client, err := cloudtasks.NewClient(ctx, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to create cloudtasks client: %v", err)
 	}
@@ -396,7 +396,7 @@ func addInCloudTasks(ctx context.Context, task *Task, queueName string) (*Task, 
 		return &resultTask, nil
 	}
 
-	err = sendRESTTask(ctx, queueName, taskName, payload)
+	err = sendTask(ctx, queueName, taskName, payload)
 	if err != nil {
 		return nil, err
 	}
@@ -451,7 +451,7 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 		opts = append(opts, option.WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})))
 	}
 
-	client, err := cloudtasks.NewRESTClient(ctx, opts...)
+	client, err := cloudtasks.NewClient(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create cloudtasks client: %v", err)
 	}
@@ -559,7 +559,7 @@ func deleteMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName strin
 		opts = append(opts, option.WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})))
 	}
 
-	client, err := cloudtasks.NewRESTClient(ctx, opts...)
+	client, err := cloudtasks.NewClient(ctx, opts...)
 	if err != nil {
 		return fmt.Errorf("failed to create cloudtasks client: %v", err)
 	}

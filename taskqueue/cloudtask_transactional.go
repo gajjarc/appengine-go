@@ -105,7 +105,7 @@ func dispatchPendingTasks(ctx context.Context, handle uint64) {
 			continue
 		}
 
-		err = sendRESTTask(noCancelCtx, taskEntity.QueueName, taskEntity.CloudTaskName, taskEntity.CloudTaskPayload)
+		err = sendTask(noCancelCtx, taskEntity.QueueName, taskEntity.CloudTaskName, taskEntity.CloudTaskPayload)
 		if err != nil {
 			if err == ErrTaskAlreadyAdded {
 				datastore.Delete(noCancelCtx, key)
@@ -167,7 +167,7 @@ func sweep(ctx context.Context) error {
 			continue
 		}
 
-		err := sendRESTTask(ctx, task.QueueName, task.CloudTaskName, task.CloudTaskPayload)
+		err := sendTask(ctx, task.QueueName, task.CloudTaskName, task.CloudTaskPayload)
 		if err != nil && err != ErrTaskAlreadyAdded {
 			logErrorf(ctx, "Sweeper failed to dispatch task %s: %v", task.CloudTaskName, err)
 			task.RetryCount++
