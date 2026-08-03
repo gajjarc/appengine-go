@@ -256,7 +256,11 @@ func sendRESTTask(ctx context.Context, queueName string, taskName string, jsonPa
 				}
 			}
 			if bodyStr, ok := aeReq["body"].(string); ok {
-				ae.Body = []byte(bodyStr)
+				if bodyBytes, err := base64.StdEncoding.DecodeString(bodyStr); err == nil {
+					ae.Body = bodyBytes
+				} else {
+					ae.Body = []byte(bodyStr)
+				}
 			}
 			if routing, ok := aeReq["app_engine_routing"].(map[string]interface{}); ok {
 				ae.AppEngineRouting = &taskspb.AppEngineRouting{}
@@ -398,10 +402,10 @@ func buildTaskMap(ctx context.Context, queueName string, task *Task) (map[string
 	}
 
 	aeReq := map[string]interface{}{
-		"httpMethod":       task.method(),
-		"relativeUri":      path,
-		"headers":          headers,
-		"appEngineRouting": routing,
+		"http_method":        task.method(),
+		"relative_uri":       path,
+		"headers":             headers,
+		"app_engine_routing": routing,
 	}
 
 	if len(task.Payload) > 0 {
@@ -409,8 +413,8 @@ func buildTaskMap(ctx context.Context, queueName string, task *Task) (map[string
 	}
 
 	taskMap := map[string]interface{}{
-		"name":                 fullTaskName,
-		"appEngineHttpRequest": aeReq,
+		"name":                   fullTaskName,
+		"app_engine_http_request": aeReq,
 	}
 
 	eta := task.ETA
