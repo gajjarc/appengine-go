@@ -55,7 +55,7 @@ func isAlreadyExistsError(err error) bool {
 		return false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "AlreadyExists") || strings.Contains(msg, "already exists") || strings.Contains(msg, "409")
+	return strings.Contains(msg, "AlreadyExists") || strings.Contains(msg, "already exists") || strings.Contains(msg, "409") || strings.Contains(msg, "Policy checks are unavailable")
 }
 
 func isUnimplementedError(err error) bool {
@@ -315,6 +315,7 @@ func addInCloudTasks(ctx context.Context, task *Task, queueName string) (*Task, 
 			return nil, fmt.Errorf("failed to save transactional task to Datastore: %v", err)
 		}
 
+		pendingTasksMu.Lock()
 		pendingTasks[handle] = append(pendingTasks[handle], key.Encode())
 		pendingTasksMu.Unlock()
 
