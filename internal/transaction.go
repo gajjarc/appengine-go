@@ -135,10 +135,8 @@ func RunTransactionOnce(c context.Context, f func(context.Context) error, xg boo
 		if PostCommitHook != nil {
 			PostCommitHook(c, t.transaction.GetHandle())
 		}
-	} else {
-		if RollbackHook != nil {
-			RollbackHook(t.transaction.GetHandle())
-		}
+	} else if RollbackHook != nil {
+		RollbackHook(t.transaction.GetHandle())
 	}
 	return &t.transaction, err
 }
