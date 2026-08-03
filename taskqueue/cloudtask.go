@@ -20,94 +20,36 @@ import (
 
 	cloudtasks "cloud.google.com/go/cloudtasks/apiv2beta3"
 	taskspb "cloud.google.com/go/cloudtasks/apiv2beta3/cloudtaskspb"
-	"google.golang.org/api/option"
-	"golang.org/x/oauth2"
 )
 
 var taskNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
-type metadataToken struct {
-	AccessToken string `json:"access_token"`
-}
-
-func getAccessToken(ctx context.Context) (string, error) {
-	req, err := http.NewRequest("GET", "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token", nil)
-	if err != nil {
-		return "", err
+func getQueuePath(ctx context.Context, queueName string) (string, error) {
+	if queueName == "" {
+		queueName = "default"
 	}
-	req.Header.Set("Metadata-Flavor", "Google")
-	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("metadata server returned status %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	var token metadataToken
-	if err := json.Unmarshal(body, &token); err != nil {
-		return "", err
-	}
-	return token.AccessToken, nil
-}
-
-func getRegion(ctx context.Context) (string, error) {
-	req, err := http.NewRequest("GET", "http://metadata.google.internal/computeMetadata/v1/instance/region", nil)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Metadata-Flavor", "Google")
-	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("metadata server returned status %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", err
-	}
-	parts := strings.Split(strings.TrimSpace(string(body)), "/")
-	if len(parts) == 0 {
-		return "", fmt.Errorf("invalid region format: %s", string(body))
-	}
-	return parts[len(parts)-1], nil
-}
-
-func sendTask(ctx context.Context, queueName string, taskName string, taskObj *taskspb.Task) (string, error) {
 	project := appengine.AppID(ctx)
 	if idx := strings.Index(project, "~"); idx != -1 {
 		project = project[idx+1:]
 	}
-
 	region, err := getRegion(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to get region: %v", err)
 	}
+	return fmt.Sprintf("projects/%s/locations/%s/queues/%s", project, region, queueName), nil
+}
 
-	token, err := getAccessToken(ctx)
+func sendTask(ctx context.Context, queueName string, taskName string, taskObj *taskspb.Task) (string, error) {
+	parent, err := getQueuePath(ctx, queueName)
 	if err != nil {
-		return "", fmt.Errorf("failed to get access token: %v", err)
+		return "", err
 	}
 
-	opts := []option.ClientOption{}
-	if token != "" {
-		opts = append(opts, option.WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})))
-	}
-
-	client, err := cloudtasks.NewClient(ctx, opts...)
+	client, err := cloudtasks.NewClient(ctx)
 	if err != nil {
 		return "", fmt.Errorf("failed to create cloudtasks client: %v", err)
 	}
 	defer client.Close()
-
-	parent := fmt.Sprintf("projects/%s/locations/%s/queues/%s", project, region, queueName)
 
 	req := &taskspb.CreateTaskRequest{
 		Parent: parent,
@@ -344,32 +286,15 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 		return results, nil
 	}
 
-	if queueName == "" {
-		queueName = "default"
-	}
-	project := appengine.AppID(ctx)
-	if idx := strings.Index(project, "~"); idx != -1 {
-		project = project[idx+1:]
-	}
-	region, err := getRegion(ctx)
+	fullQueueName, err := getQueuePath(ctx, queueName)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get region: %v", err)
+		return nil, err
 	}
-	token, err := getAccessToken(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get access token: %v", err)
-	}
-	fullQueueName := fmt.Sprintf("projects/%s/locations/%s/queues/%s", project, region, queueName)
 
 	me, any := make(appengine.MultiError, len(tasks)), false
 	results := make([]*Task, len(tasks))
 
-	opts := []option.ClientOption{}
-	if token != "" {
-		opts = append(opts, option.WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})))
-	}
-
-	client, err := cloudtasks.NewClient(ctx, opts...)
+	client, err := cloudtasks.NewClient(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create cloudtasks client: %v", err)
 	}
@@ -438,29 +363,12 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 }
 
 func deleteMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) error {
-	if queueName == "" {
-		queueName = "default"
-	}
-	project := appengine.AppID(ctx)
-	if idx := strings.Index(project, "~"); idx != -1 {
-		project = project[idx+1:]
-	}
-	region, err := getRegion(ctx)
+	fullQueueName, err := getQueuePath(ctx, queueName)
 	if err != nil {
-		return fmt.Errorf("failed to get region: %v", err)
-	}
-	token, err := getAccessToken(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get access token: %v", err)
-	}
-	fullQueueName := fmt.Sprintf("projects/%s/locations/%s/queues/%s", project, region, queueName)
-
-	opts := []option.ClientOption{}
-	if token != "" {
-		opts = append(opts, option.WithTokenSource(oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})))
+		return err
 	}
 
-	client, err := cloudtasks.NewClient(ctx, opts...)
+	client, err := cloudtasks.NewClient(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to create cloudtasks client: %v", err)
 	}
