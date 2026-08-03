@@ -80,7 +80,7 @@ func getRegion(ctx context.Context) (string, error) {
 	return parts[len(parts)-1], nil
 }
 
-func sendTask(ctx context.Context, queueName string, taskName string, jsonPayload string) error {
+func sendTask(ctx context.Context, queueName string, taskName string, jsonPayload string) (string, error) {
 	project := appengine.AppID(ctx)
 	if idx := strings.Index(project, "~"); idx != -1 {
 		project = project[idx+1:]
@@ -88,12 +88,12 @@ func sendTask(ctx context.Context, queueName string, taskName string, jsonPayloa
 
 	region, err := getRegion(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get region: %v", err)
+		return "", fmt.Errorf("failed to get region: %v", err)
 	}
 
 	token, err := getAccessToken(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get access token: %v", err)
+		return "", fmt.Errorf("failed to get access token: %v", err)
 	}
 
 	opts := []option.ClientOption{}
@@ -103,7 +103,7 @@ func sendTask(ctx context.Context, queueName string, taskName string, jsonPayloa
 
 	client, err := cloudtasks.NewClient(ctx, opts...)
 	if err != nil {
-		return fmt.Errorf("failed to create cloudtasks client: %v", err)
+		return "", fmt.Errorf("failed to create cloudtasks client: %v", err)
 	}
 	defer client.Close()
 
@@ -157,20 +157,22 @@ func sendTask(ctx context.Context, queueName string, taskName string, jsonPayloa
 		req.Task = taskObj
 	}
 
-	_, err = client.CreateTask(ctx, req)
+	createdTask, err := client.CreateTask(ctx, req)
 	if err != nil {
 		if strings.Contains(err.Error(), "AlreadyExists") || strings.Contains(err.Error(), "409") {
-			return ErrTaskAlreadyAdded
+			return "", ErrTaskAlreadyAdded
 		}
-		return err
+		return "", err
 	}
-	return nil
-}
-
-func generateUUID() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+	shortName := taskName
+	if createdTask != nil && createdTask.Name != "" {
+		if idx := strings.LastIndex(createdTask.Name, "/"); idx != -1 {
+			shortName = createdTask.Name[idx+1:]
+		} else {
+			shortName = createdTask.Name
+		}
+	}
+	return shortName, nil
 }
 
 func extractServiceFromHost(ctx context.Context, host string) string {
@@ -252,11 +254,10 @@ func buildTaskMap(ctx context.Context, queueName string, task *Task) (map[string
 	}
 
 	taskName := task.Name
-	if taskName == "" {
-		taskName = "task-" + generateUUID()
+	var fullTaskName string
+	if taskName != "" {
+		fullTaskName = fmt.Sprintf("projects/%s/locations/%s/queues/%s/tasks/%s", project, region, queueName, taskName)
 	}
-
-	fullTaskName := fmt.Sprintf("projects/%s/locations/%s/queues/%s/tasks/%s", project, region, queueName, taskName)
 
 	path := task.Path
 	if path == "" {
@@ -276,8 +277,10 @@ func buildTaskMap(ctx context.Context, queueName string, task *Task) (map[string
 	if _, ok := headers["X-AppEngine-QueueName"]; !ok {
 		headers["X-AppEngine-QueueName"] = queueName
 	}
-	if _, ok := headers["X-AppEngine-TaskName"]; !ok {
-		headers["X-AppEngine-TaskName"] = taskName
+	if taskName != "" {
+		if _, ok := headers["X-AppEngine-TaskName"]; !ok {
+			headers["X-AppEngine-TaskName"] = taskName
+		}
 	}
 
 	targetService := extractServiceFromHost(ctx, headers["Host"])
@@ -297,8 +300,10 @@ func buildTaskMap(ctx context.Context, queueName string, task *Task) (map[string
 	}
 
 	taskMap := map[string]interface{}{
-		"name":                   fullTaskName,
 		"app_engine_http_request": aeReq,
+	}
+	if fullTaskName != "" {
+		taskMap["name"] = fullTaskName
 	}
 
 	eta := task.ETA
@@ -337,7 +342,7 @@ func buildTaskMap(ctx context.Context, queueName string, task *Task) (map[string
 	return taskMap, taskName, nil
 }
 
-func buildRESTPayload(ctx context.Context, queueName string, task *Task) (string, string, error) {
+func serializeTaskPayload(ctx context.Context, queueName string, task *Task) (string, string, error) {
 	taskMap, taskName, err := buildTaskMap(ctx, queueName, task)
 	if err != nil {
 		return "", "", err
@@ -360,7 +365,7 @@ func addInCloudTasks(ctx context.Context, task *Task, queueName string) (*Task, 
 		queueName = "default"
 	}
 
-	payload, taskName, err := buildRESTPayload(ctx, queueName, task)
+	payload, taskName, err := serializeTaskPayload(ctx, queueName, task)
 	if err != nil {
 		return nil, err
 	}
@@ -394,13 +399,13 @@ func addInCloudTasks(ctx context.Context, task *Task, queueName string) (*Task, 
 		return &resultTask, nil
 	}
 
-	err = sendTask(ctx, queueName, taskName, payload)
+	assignedName, err := sendTask(ctx, queueName, taskName, payload)
 	if err != nil {
 		return nil, err
 	}
 
 	resultTask := *task
-	resultTask.Name = taskName
+	resultTask.Name = assignedName
 	resultTask.Method = task.method()
 	return &resultTask, nil
 }
@@ -476,8 +481,9 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 			results[chunkStart+i].Name = taskName
 			results[chunkStart+i].Method = t.method()
 
-			taskObj := &taskspb.Task{
-				Name: fmt.Sprintf("%s/tasks/%s", fullQueueName, taskName),
+			taskObj := &taskspb.Task{}
+			if taskName != "" {
+				taskObj.Name = fmt.Sprintf("%s/tasks/%s", fullQueueName, taskName)
 			}
 			if aeReq, ok := taskMap["app_engine_http_request"].(map[string]interface{}); ok {
 				ae := &taskspb.AppEngineHttpRequest{}
@@ -517,7 +523,36 @@ func addMultiInCloudTasks(ctx context.Context, tasks []*Task, queueName string) 
 			Requests: createReqs,
 		}
 
-		_, err = client.BatchCreateTasks(ctx, batchReq)
+		resp, err := client.BatchCreateTasks(ctx, batchReq)
+		if err != nil {
+			if strings.Contains(err.Error(), "Unimplemented") || strings.Contains(err.Error(), "unknown method") || strings.Contains(err.Error(), "404") {
+				for i, t := range chunkTasks {
+					if me[chunkStart+i] != nil {
+						continue
+					}
+					res, err := addInCloudTasks(ctx, t, queueName)
+					if err != nil {
+						me[chunkStart+i] = err
+						any = true
+					} else {
+						results[chunkStart+i] = res
+					}
+				}
+			} else {
+				parseOperationErrors([]byte(err.Error()), len(chunkTasks), chunkStart, me, &any, false)
+			}
+		} else if resp != nil {
+			for i, createdTask := range resp.Tasks {
+				if createdTask != nil && createdTask.Name != "" && results[chunkStart+i] != nil {
+					if idx := strings.LastIndex(createdTask.Name, "/"); idx != -1 {
+						results[chunkStart+i].Name = createdTask.Name[idx+1:]
+					} else {
+						results[chunkStart+i].Name = createdTask.Name
+					}
+				}
+			}
+		}
+	}
 		if err != nil {
 			for i := range chunkTasks {
 				if me[chunkStart+i] == nil {
