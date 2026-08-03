@@ -285,7 +285,7 @@ var alreadyAddedErrors = map[pb.TaskQueueServiceError_ErrorCode]bool{
 // Add returns an equivalent Task with defaults filled in, including setting
 // the task's Name field to the chosen name if the original was empty.
 func Add(c context.Context, task *Task, queueName string) (*Task, error) {
-	if os.Getenv("GAE_PUSHQUEUE_BACKEND") == "CLOUD_TASK" && task.Method != "PULL" {
+	if useCloudTasks() && task.Method != "PULL" {
 		return addInCloudTasks(c, task, queueName)
 	}
 	req, err := newAddReq(c, task, queueName)
@@ -314,7 +314,7 @@ func Add(c context.Context, task *Task, queueName string) (*Task, error) {
 // each task's Name field to the chosen name if the original was empty.
 // If a given task is badly formed or could not be added, an appengine.MultiError is returned.
 func AddMulti(c context.Context, tasks []*Task, queueName string) ([]*Task, error) {
-	if os.Getenv("GAE_PUSHQUEUE_BACKEND") == "CLOUD_TASK" {
+	if useCloudTasks() {
 		if len(tasks) > 0 && tasks[0].Method != "PULL" {
 			return addMultiInCloudTasks(c, tasks, queueName)
 		}
@@ -377,7 +377,7 @@ func Delete(c context.Context, task *Task, queueName string) error {
 // Each task is deleted independently; one may fail to delete while the others
 // are successfully deleted.
 func DeleteMulti(c context.Context, tasks []*Task, queueName string) error {
-	if os.Getenv("GAE_PUSHQUEUE_BACKEND") == "CLOUD_TASK" {
+	if useCloudTasks() {
 		if len(tasks) > 0 && tasks[0].Method != "PULL" && !strings.Contains(queueName, "pull") {
 			return deleteMultiInCloudTasks(c, tasks, queueName)
 		}

@@ -42,6 +42,10 @@ var (
 	}
 )
 
+func useCloudTasks() bool {
+	return os.Getenv("GAE_PUSHQUEUE_BACKEND") == "CLOUD_TASK"
+}
+
 func newUnknownTaskError(detail string) error {
 	return &internal.APIError{
 		Service: "taskqueue",
