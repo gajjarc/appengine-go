@@ -7,12 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"regexp"
 	"strings"
-	"sync"
 	"time"
 
 	"google.golang.org/appengine"
