@@ -23,7 +23,6 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/golang/protobuf/proto"
@@ -377,7 +376,7 @@ func Delete(c context.Context, task *Task, queueName string) error {
 // are successfully deleted.
 func DeleteMulti(c context.Context, tasks []*Task, queueName string) error {
 	if useCloudTasks() {
-		if len(tasks) > 0 && tasks[0].Method != "PULL" && !strings.Contains(queueName, "pull") {
+		if len(tasks) > 0 && tasks[0].Method != "PULL" {
 			return deleteMultiInCloudTasks(c, tasks, queueName)
 		}
 	}
