@@ -248,14 +248,19 @@ func buildCloudTaskProto(ctx context.Context, queueName string, task *Task) (*ta
 		}
 	}
 
-	targetService := extractServiceFromHost(ctx, headers["Host"])
+	var routing *taskspb.AppEngineRouting
+	if host := headers["Host"]; host != "" {
+		if service := extractServiceFromHost(ctx, host); service != "" {
+			routing = &taskspb.AppEngineRouting{
+				Service: service,
+			}
+		}
+	}
 	ae := &taskspb.AppEngineHttpRequest{
-		RelativeUri: path,
-		Headers:     headers,
-		Body:        task.Payload,
-		AppEngineRouting: &taskspb.AppEngineRouting{
-			Service: targetService,
-		},
+		RelativeUri:      path,
+		Headers:          headers,
+		Body:             task.Payload,
+		AppEngineRouting: routing,
 	}
 	if code, ok := taskspb.HttpMethod_value[task.method()]; ok {
 		ae.HttpMethod = taskspb.HttpMethod(code)
