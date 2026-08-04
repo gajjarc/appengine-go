@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,7 +44,8 @@ var (
 )
 
 func useCloudTasks() bool {
-	return os.Getenv("GAE_PUSHQUEUE_BACKEND") == "CLOUD_TASK"
+	v, _ := strconv.ParseBool(os.Getenv("APPENGINE_USE_CLOUDTASK_PUSH_QUEUE"))
+	return v
 }
 
 func newUnknownTaskError(detail string) error {
