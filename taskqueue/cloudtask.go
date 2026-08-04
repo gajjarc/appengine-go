@@ -255,6 +255,7 @@ func buildCloudTaskProto(ctx context.Context, queueName string, task *Task) (*ta
 				Service: service,
 			}
 		}
+		delete(headers, "Host")
 	}
 	ae := &taskspb.AppEngineHttpRequest{
 		RelativeUri:      path,
