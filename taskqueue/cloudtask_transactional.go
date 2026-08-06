@@ -9,9 +9,9 @@ import (
 	"sync"
 	"time"
 
-	"google.golang.org/appengine/v2"
-	"google.golang.org/appengine/v2/datastore"
-	"google.golang.org/appengine/v2/internal"
+	"google.golang.org/appengine"
+	"google.golang.org/appengine/datastore"
+	"google.golang.org/appengine/internal"
 	"google.golang.org/protobuf/proto"
 
 	taskspb "cloud.google.com/go/cloudtasks/apiv2beta3/cloudtaskspb"
