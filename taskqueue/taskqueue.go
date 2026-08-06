@@ -283,6 +283,13 @@ var alreadyAddedErrors = map[pb.TaskQueueServiceError_ErrorCode]bool{
 // Add returns an equivalent Task with defaults filled in, including setting
 // the task's Name field to the chosen name if the original was empty.
 func Add(c context.Context, task *Task, queueName string) (*Task, error) {
+	if task.Name == "" {
+		if useCloudTasks() && task.Method != "PULL" {
+			task.Name = fmt.Sprintf("ct-%d", time.Now().UnixNano())
+		} else {
+			task.Name = fmt.Sprintf("tq-%d", time.Now().UnixNano())
+		}
+	}
 	if useCloudTasks() && task.Method != "PULL" {
 		return addInCloudTasks(c, task, queueName)
 	}
@@ -312,6 +319,15 @@ func Add(c context.Context, task *Task, queueName string) (*Task, error) {
 // each task's Name field to the chosen name if the original was empty.
 // If a given task is badly formed or could not be added, an appengine.MultiError is returned.
 func AddMulti(c context.Context, tasks []*Task, queueName string) ([]*Task, error) {
+	for _, t := range tasks {
+		if t.Name == "" {
+			if useCloudTasks() && t.Method != "PULL" {
+				t.Name = fmt.Sprintf("ct-%d", time.Now().UnixNano())
+			} else {
+				t.Name = fmt.Sprintf("tq-%d", time.Now().UnixNano())
+			}
+		}
+	}
 	if useCloudTasks() {
 		if len(tasks) > 0 && tasks[0].Method != "PULL" {
 			return addMultiInCloudTasks(c, tasks, queueName)
