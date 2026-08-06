@@ -27,7 +27,7 @@ import (
 
 	"github.com/golang/protobuf/proto"
 
-	"google.golang.org/appengine/v2/v2"
+	"google.golang.org/appengine/v2"
 	"google.golang.org/appengine/v2/internal"
 	dspb "google.golang.org/appengine/v2/internal/datastore"
 	pb "google.golang.org/appengine/v2/internal/taskqueue"

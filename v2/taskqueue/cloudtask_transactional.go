@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"google.golang.org/appengine/v2/v2"
+	"google.golang.org/appengine/v2"
 	"google.golang.org/appengine/v2/datastore"
 	"google.golang.org/appengine/v2/internal"
 	"google.golang.org/protobuf/proto"
